@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   map:
-    if: github.repository == 'AGForge-Labs/ApartmentFinder-public' && github.actor_id == '105477711'
+    if: github.repository == 'Galaxybigbird/ApartmentFinder-public' && github.actor_id == '105477711'
     runs-on: macos-15-intel
     timeout-minutes: 25
     env:

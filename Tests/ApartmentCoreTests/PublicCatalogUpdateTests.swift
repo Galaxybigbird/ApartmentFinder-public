@@ -243,7 +243,7 @@ final class PublicCatalogUpdateTests: XCTestCase {
         var fictionalCredentials = URLComponents(url: PublicCatalogUpdateClient.latestURL, resolvingAgainstBaseURL: false)!
         fictionalCredentials.user = "fictional-user"
         fictionalCredentials.password = UUID().uuidString
-        for string in ["https://example.invalid/latest.json", "http://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/latest.json", fictionalCredentials.string!, "https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/main/latest.json"] {
+        for string in ["https://example.invalid/latest.json", "http://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/latest.json", fictionalCredentials.string!, "https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/main/latest.json"] {
             do { _ = try await PublicCatalogUpdateTransport.fetch(XCTUnwrap(URL(string: string)), maximum: 100); XCTFail("Unsafe endpoint accepted") } catch { }
         }
         XCTAssertThrowsError(try PublicCatalogUpdateTransport.validateResponse(statusCode: 302, finalURL: PublicCatalogUpdateClient.latestURL, expectedURL: PublicCatalogUpdateClient.latestURL, declaredLength: 0, maximum: 100))
@@ -254,17 +254,17 @@ final class PublicCatalogUpdateTests: XCTestCase {
     func testProductionTransportCountsActualChunksWithoutContentLengthAndRejectsRedirectResponses() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PublicFeedProtocol.self]
-        let allowed = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/revisions/chunked/public-catalog.json"))
+        let allowed = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/revisions/chunked/public-catalog.json"))
         do {
             _ = try await PublicCatalogUpdateTransport.fetch(allowed, maximum: 8, configuration: configuration)
             XCTFail("Chunked body exceeded the actual byte budget")
         } catch { XCTAssertTrue(String(describing: error).contains("actual byte budget"), "Unexpected transport error: \(error)") }
-        let redirect = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/revisions/redirect/public-catalog.json"))
+        let redirect = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/revisions/redirect/public-catalog.json"))
         do {
             _ = try await PublicCatalogUpdateTransport.fetch(redirect, maximum: 100, configuration: configuration)
             XCTFail("Redirect response accepted")
         } catch { }
-        let good = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/revisions/good/public-catalog.json"))
+        let good = try XCTUnwrap(URL(string: "https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/revisions/good/public-catalog.json"))
         let result = try await PublicCatalogUpdateTransport.fetch(good, maximum: 8, configuration: configuration)
         XCTAssertEqual(result, Data("ok".utf8))
     }

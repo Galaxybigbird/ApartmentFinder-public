@@ -1,6 +1,6 @@
 # Public catalog feed operations
 
-The feed uses the existing public `AGForge-Labs/ApartmentFinder-public` repository's `catalog-data` branch. The app reads `https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/latest.json` without credentials. The publisher prepares local files only; it does not contact GitHub, build iOS, sign, upload or change tester access.
+The feed uses the existing public `Galaxybigbird/ApartmentFinder-public` repository's `catalog-data` branch. The app reads `https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/latest.json` without credentials. The publisher prepares local files only; it does not contact GitHub, build iOS, sign, upload or change tester access.
 
 Use only an explicitly reviewed public bundle directory containing exactly these five files: `public-catalog.json`, `public-locations.geojson`, `public-paths.geojson`, `known-addresses.json` and `public-catalog-review.json`. Existing public admission checks must pass, including review digests, source joins, precision qualifications and estimate flags. A backup, device store, delivery manifest or personal export is never a publishing input. Field admission does not replace human source/privacy review.
 

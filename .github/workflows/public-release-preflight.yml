@@ -32,7 +32,7 @@ concurrency:
 jobs:
   infrastructure:
     if: >-
-      github.repository == 'AGForge-Labs/ApartmentFinder-public' &&
+      github.repository == 'Galaxybigbird/ApartmentFinder-public' &&
       github.event.repository.private == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
@@ -66,7 +66,7 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
   public-core:
     if: >-
-      github.repository == 'AGForge-Labs/ApartmentFinder-public' &&
+      github.repository == 'Galaxybigbird/ApartmentFinder-public' &&
       github.event.repository.private == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15-intel

@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 BASE='708ef295532acb95c211bb76135ffd9ee01610da'
 RELEASE_PARENT='c8399d1a16cbd1dc144a40c5d8825de627509dc7'
 PRIOR_RUN=39868707775
-REPO='AGForge-Labs/ApartmentFinder-public'
+REPO='Galaxybigbird/ApartmentFinder-public'
 ALLOWED={'.github/workflows/public-testflight.yml','scripts/public-release-current-ui-risk.py','Tests/release/test_public_release_recovery.py'}
 
 def require(value):

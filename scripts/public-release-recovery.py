@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = 'd7f43ed3729e4006035e8d85f813429b84b5b9af'
 PASS_RUN = 39615213146
 FAILED_RUN = 39637858856
-REPO = 'AGForge-Labs/ApartmentFinder-public'
+REPO = 'Galaxybigbird/ApartmentFinder-public'
 ALLOWED = {'.github/workflows/public-testflight.yml', 'scripts/public-release-recovery.py',
            'Tests/release/test_public_release_recovery.py'}
 REQUIRED_STEPS = {'Selected synthetic core tests with exact identity verification',
