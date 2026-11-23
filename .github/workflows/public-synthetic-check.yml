@@ -35,7 +35,7 @@ jobs:
       max-parallel: 4
       matrix:
         shard: ${{ fromJSON(inputs.scope == 'regression' && '[0,1,2,3]' || '[0]') }}
-    if: ${{ inputs.approve_runner && github.repository == 'AGForge-Labs/ApartmentFinder-public' && github.event.repository.private == false }}
+    if: ${{ inputs.approve_runner && github.repository == 'Galaxybigbird/ApartmentFinder-public' && github.event.repository.private == false }}
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:

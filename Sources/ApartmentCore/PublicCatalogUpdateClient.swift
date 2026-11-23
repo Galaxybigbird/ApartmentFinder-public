@@ -5,7 +5,7 @@ import FoundationNetworking
 
 public struct PublicCatalogUpdateClient: Sendable {
     public typealias Fetch = @Sendable (URL, Int) async throws -> Data
-    public static let latestURL = URL(string: "https://raw.githubusercontent.com/AGForge-Labs/ApartmentFinder-public/catalog-data/latest-v3.json")!
+    public static let latestURL = URL(string: "https://raw.githubusercontent.com/Galaxybigbird/ApartmentFinder-public/catalog-data/latest-v3.json")!
     private let fetch: Fetch
     public init(fetch: @escaping Fetch = PublicCatalogUpdateTransport.fetch) { self.fetch = fetch }
 
@@ -66,7 +66,7 @@ public enum PublicCatalogUpdateTransport {
             throw CoreError("The public catalog URL is outside the fixed feed.")
         }
         if url == PublicCatalogUpdateClient.latestURL { return }
-        let prefix = "/AGForge-Labs/ApartmentFinder-public/catalog-data/revisions/"
+        let prefix = "/Galaxybigbird/ApartmentFinder-public/catalog-data/revisions/"
         guard parts.percentEncodedPath.hasPrefix(prefix) else { throw CoreError("Unsupported public catalog path.") }
         let suffix = String(parts.percentEncodedPath.dropFirst(prefix.count)).split(separator: "/", omittingEmptySubsequences: false)
         let allowedFiles = Set(PublicCatalogUpdateManifest.fileNames + PublicCatalogUpdateManifest.fileNames.map { $0 + ".gz" })

@@ -49,7 +49,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.authorize_upload &&
       !inputs.skip_regression_tests &&
-      github.repository == 'AGForge-Labs/ApartmentFinder-public' && !github.event.repository.private &&
+      github.repository == 'Galaxybigbird/ApartmentFinder-public' && !github.event.repository.private &&
       github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
       github.ref == 'refs/heads/main' && github.run_attempt == 1
     strategy:
@@ -101,7 +101,7 @@ jobs:
     if: >-
       always() && !cancelled() &&
       github.event_name == 'workflow_dispatch' && inputs.authorize_upload &&
-      github.repository == 'AGForge-Labs/ApartmentFinder-public' && !github.event.repository.private &&
+      github.repository == 'Galaxybigbird/ApartmentFinder-public' && !github.event.repository.private &&
       github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
       github.ref == 'refs/heads/main' && github.run_attempt == 1 &&
       (needs.validate.result == 'success' ||
