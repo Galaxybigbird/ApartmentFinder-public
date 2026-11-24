@@ -31,14 +31,18 @@ struct ApartmentDeliveryMap: View {
         let ready: Bool
         var buildingReference: Bool { place.referenceKind != nil }
         var id: String { stop.id + "|" + place.id }
-        var estimatedAreaRadius: CLLocationDistance {
-            guard let estimate = place.entranceSideEstimate else { return 0 }
-            let origin = CLLocation(latitude: place.coordinate.latitude, longitude: place.coordinate.longitude)
-            let frontageDistance = estimate.frontage.map {
-                origin.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude))
-            }.max() ?? 0
-            // Cover the whole supported frontage plus its uncalibrated allowance.
-            return frontageDistance + estimate.workingAllowanceMeters
+        var highlightZoneRadius: CLLocationDistance {
+            if let estimate = place.entranceSideEstimate {
+                let origin = CLLocation(latitude: place.coordinate.latitude, longitude: place.coordinate.longitude)
+                let frontageDistance = estimate.frontage.map {
+                    origin.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude))
+                }.max() ?? 0
+                // Cover the whole supported frontage plus its uncalibrated allowance.
+                return frontageDistance + estimate.workingAllowanceMeters
+            }
+            if stop.completed { return 6.0 }
+            if ready { return 6.5 }
+            return 9.0
         }
         var estimateReferenceLabel: String? {
             guard place.entranceSideEstimate != nil else { return nil }
@@ -104,7 +108,7 @@ struct ApartmentDeliveryMap: View {
                     status: pin.status, ready: pin.ready, completed: pin.stop.completed,
                     selected: pin.stop.id == focusedStopID, estimated: pin.place.verification == .estimated,
                     referenceLabel: pin.estimateReferenceLabel ?? (pin.buildingReference ? "Unit \(pin.stop.unit) · B\(pin.place.building) area" : nil),
-                    radius: pin.estimatedAreaRadius, frontage: pin.place.entranceSideEstimate?.frontage ?? [])
+                    radius: pin.highlightZoneRadius, frontage: pin.place.entranceSideEstimate?.frontage ?? [])
             }, guides: guides(pins), areas: areas, frameCoordinates: coordinates, coverage: coverage(pins),
             locker: locker, location: location, select: select)
         #if DEBUG && targetEnvironment(simulator)

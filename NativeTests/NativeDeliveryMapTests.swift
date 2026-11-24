@@ -74,13 +74,43 @@ final class NativeDeliveryMapTests: XCTestCase {
 
     func testSelectionUpdatesExistingPinAndKeepsTheManifestTapTarget() throws {
         var selected: String?
-        let first = model(select: { selected = $0 })
+        let frontage = [
+            Coordinate(latitude: 36.01, longitude: -115.1801),
+            Coordinate(latitude: 36.01, longitude: -115.1799)
+        ]
+        func makeWithFrontage(selected isSelected: Bool) -> NativeDeliveryMap {
+            NativeDeliveryMap(pins: [.init(id: "stop|place", stopID: "stop", placeID: "place",
+                coordinate: .init(latitude: 36.01, longitude: -115.18), sequenceID: 7, sequence: "7", unit: "1158",
+                building: "12", status: "Estimated shared entry", ready: false, completed: false,
+                selected: isSelected, estimated: true, referenceLabel: "1158 · B12", radius: 10, frontage: frontage)],
+                areas: [], community: nil, locker: nil, userLocation: nil, bearing: nil,
+                camera: .camera(MapCamera(centerCoordinate: .init(latitude: 36.01, longitude: -115.18), distance: 350, heading: 0)),
+                style: .standard, select: { selected = $0 }, userMoved: { _ in }, cameraSettled: { _ in })
+        }
+        let first = makeWithFrontage(selected: false)
         let coordinator = first.makeCoordinator()
         let map = coordinator.makeMapView()
         coordinator.update(map, model: first)
         let pin = try XCTUnwrap(map.annotations.first { $0 is NativeDeliveryMap.Annotation })
-        coordinator.update(map, model: model(selected: true, select: { selected = $0 }))
+
+        // Verify outer highlighted zone, deeper 2.2m inner core, and frontage line before selection.
+        let initialCircles = map.overlays.compactMap { $0 as? MKCircle }
+        let initialLines = map.overlays.compactMap { $0 as? MKPolyline }
+        XCTAssertEqual(Set(initialCircles.compactMap { $0.title }), ["zone", "core"])
+        XCTAssertEqual(initialLines.compactMap { $0.title }, ["frontage"])
+        let initialCore = try XCTUnwrap(initialCircles.first { $0.title == "core" })
+        XCTAssertEqual(initialCore.radius, 2.2, accuracy: 0.01)
+
+        // Verify selection updates existing pin, refreshes overlays to deeper selected styles, and keeps tap target.
+        coordinator.update(map, model: makeWithFrontage(selected: true))
         XCTAssertTrue(map.annotations.contains { ($0 as AnyObject) === (pin as AnyObject) })
+        let selectedCircles = map.overlays.compactMap { $0 as? MKCircle }
+        let selectedLines = map.overlays.compactMap { $0 as? MKPolyline }
+        XCTAssertEqual(Set(selectedCircles.compactMap { $0.title }), ["zone-selected", "core-selected"])
+        XCTAssertEqual(selectedLines.compactMap { $0.title }, ["frontage-selected"])
+        let selectedLineRenderer = try XCTUnwrap(coordinator.mapView(map, rendererFor: try XCTUnwrap(selectedLines.first)) as? MKPolylineRenderer)
+        XCTAssertEqual(selectedLineRenderer.lineWidth, 4.5, accuracy: 0.01)
+
         let view = try XCTUnwrap(coordinator.mapView(map, viewFor: pin))
         coordinator.mapView(map, didSelect: view)
         XCTAssertEqual(selected, "stop")

@@ -95,23 +95,33 @@ private struct OfflineMap: View {
                 for place in places {
                     let p = point(place.coordinate), chosen = place.id == selectedID
                     if !chosen && !visiblePins.contains(p) { continue }
-                    if chosen, let estimate = place.entranceSideEstimate {
-                        let radius = entranceSideSearchRadius(place)
+                    if chosen {
+                        let radius = place.entranceSideEstimate != nil
+                            ? entranceSideSearchRadius(place)
+                            : (place.verification == .fieldVerified ? 6.5 : 9.0)
+                        let accent: Color = (place.verification == .fieldVerified && place.entranceSideEstimate == nil) ? .teal : .orange
                         let latitudeOffset = radius / 111_195
                         let longitudeOffset = latitudeOffset / max(0.01, abs(bounds.longitudeScale))
                         let north = point(Coordinate(latitude: place.coordinate.latitude + latitudeOffset, longitude: place.coordinate.longitude))
                         let east = point(Coordinate(latitude: place.coordinate.latitude, longitude: place.coordinate.longitude + longitudeOffset))
-                        let rx = abs(east.x - p.x), ry = abs(north.y - p.y)
+                        let rx = max(14, abs(east.x - p.x)), ry = max(14, abs(north.y - p.y))
                         let region = Path(ellipseIn: CGRect(x: p.x-rx, y: p.y-ry, width: rx*2, height: ry*2))
-                        context.fill(region, with: .color(.orange.opacity(0.12)))
-                        context.stroke(region, with: .color(.orange.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [4,3]))
-                        if estimate.frontage.count >= 2 {
-                            context.stroke(line(estimate.frontage), with: .color(.orange), style: StrokeStyle(lineWidth: 2, dash: [4,3]))
+                        context.fill(region, with: .color(accent.opacity(0.20)))
+                        context.stroke(region, with: .color(accent.opacity(0.90)), style: StrokeStyle(lineWidth: 2, dash: [6,4]))
+                        if let estimate = place.entranceSideEstimate, estimate.frontage.count >= 2 {
+                            context.stroke(line(estimate.frontage), with: .color(accent), style: StrokeStyle(lineWidth: 4, lineCap: .round, dash: [7,3]))
                         }
+                        let coreR = max(5.5, min(rx * 0.35, 11))
+                        let core = Path(ellipseIn: CGRect(x: p.x-coreR, y: p.y-coreR, width: coreR*2, height: coreR*2))
+                        context.fill(core, with: .color(accent.opacity(0.45)))
+                        context.stroke(core, with: .color(accent), lineWidth: 2)
                     }
-                    let r: CGFloat = chosen ? 9 : 3
-                    context.fill(Path(ellipseIn: CGRect(x: p.x-r,y: p.y-r,width: r*2,height: r*2)),
-                                 with: .color(place.entranceSideEstimate != nil ? .orange : chosen ? .yellow : place.kind == .door ? .mint : .cyan.opacity(0.7)))
+                    let r: CGFloat = chosen ? 5.5 : 3.5
+                    let dotColor: Color = place.entranceSideEstimate != nil ? .orange : (place.verification == .fieldVerified ? .teal : (chosen ? .orange : .orange.opacity(0.85)))
+                    if chosen {
+                        context.fill(Path(ellipseIn: CGRect(x: p.x-(r+2), y: p.y-(r+2), width: (r+2)*2, height: (r+2)*2)), with: .color(.white))
+                    }
+                    context.fill(Path(ellipseIn: CGRect(x: p.x-r,y: p.y-r,width: r*2,height: r*2)), with: .color(dotColor))
                     if chosen || (scale > 3 && !place.unit.isEmpty) {
                         let label: String
                         if place.entranceSideEstimate != nil {
@@ -219,10 +229,16 @@ private final class PinAnnotation: NSObject, MKAnnotation {
     let coordinate: CLLocationCoordinate2D
     let title: String?
     let subtitle: String?
+    let unitLabel: String
     let isEntranceSideEstimate: Bool
-    init(_ place: Place) {
+    let isVerifiedDoor: Bool
+    var isSelected: Bool
+    init(_ place: Place, selected: Bool = false) {
         recordID = place.id; coordinate = place.coordinate.cl
+        unitLabel = place.unit
         isEntranceSideEstimate = place.entranceSideEstimate != nil
+        isVerifiedDoor = place.verification == .fieldVerified && place.entranceSideEstimate == nil
+        isSelected = selected
         if place.entranceSideEstimate != nil {
             title = "Unit \(place.unit)"
             subtitle = place.pinEvidenceLabel
@@ -230,6 +246,58 @@ private final class PinAnnotation: NSObject, MKAnnotation {
             title = place.unit.isEmpty ? place.kind.label : "Unit \(place.unit)"
             subtitle = "\(place.kind.label) · Floor \(place.floor.isEmpty ? "unknown" : place.floor)"
         }
+    }
+}
+
+private final class PrecisionDotAnnotationView: MKAnnotationView {
+    private let haloLayer = CAShapeLayer()
+    private let outerLayer = CAShapeLayer()
+    private let ringLayer = CAShapeLayer()
+    private let coreLayer = CAShapeLayer()
+
+    override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
+        super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
+        backgroundColor = .clear
+        canShowCallout = true
+        frame = CGRect(x: 0, y: 0, width: 22, height: 22)
+        layer.addSublayer(haloLayer)
+        layer.addSublayer(outerLayer)
+        layer.addSublayer(ringLayer)
+        layer.addSublayer(coreLayer)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(pin: PinAnnotation) {
+        let accent: UIColor = pin.isVerifiedDoor ? .systemTeal : .systemOrange
+        let size: CGFloat = pin.isSelected ? 22 : 14
+        frame = CGRect(x: 0, y: 0, width: size, height: size)
+        let center = CGPoint(x: size / 2, y: size / 2)
+
+        if pin.isSelected {
+            haloLayer.isHidden = false
+            haloLayer.path = UIBezierPath(arcCenter: center, radius: 10.5, startAngle: 0, endAngle: .pi * 2, clockwise: true).cgPath
+            haloLayer.fillColor = accent.withAlphaComponent(0.28).cgColor
+            haloLayer.strokeColor = accent.withAlphaComponent(0.95).cgColor
+            haloLayer.lineWidth = 1.5
+        } else {
+            haloLayer.isHidden = true
+        }
+
+        let outerR: CGFloat = pin.isSelected ? 7.0 : 5.8
+        outerLayer.path = UIBezierPath(arcCenter: center, radius: outerR, startAngle: 0, endAngle: .pi * 2, clockwise: true).cgPath
+        outerLayer.fillColor = UIColor.black.withAlphaComponent(0.82).cgColor
+
+        let ringR: CGFloat = pin.isSelected ? 5.8 : 4.8
+        ringLayer.path = UIBezierPath(arcCenter: center, radius: ringR, startAngle: 0, endAngle: .pi * 2, clockwise: true).cgPath
+        ringLayer.fillColor = UIColor.white.cgColor
+
+        let coreR: CGFloat = pin.isSelected ? 4.2 : 3.4
+        coreLayer.path = UIBezierPath(arcCenter: center, radius: coreR, startAngle: 0, endAngle: .pi * 2, clockwise: true).cgPath
+        coreLayer.fillColor = accent.cgColor
+
+        zPriority = pin.isSelected ? .max : .defaultUnselected
+        displayPriority = pin.isSelected ? .required : .defaultHigh
+        accessibilityLabel = [pin.title, pin.subtitle].compactMap { $0 }.joined(separator: ". ")
     }
 }
 private final class LockerAnnotation: NSObject, MKAnnotation {
@@ -301,7 +369,17 @@ private struct StreetMap: UIViewRepresentable {
         coordinator.parent = self
         if placesChanged {
             view.removeAnnotations(view.annotations.filter { $0 is PinAnnotation })
-            view.addAnnotations(places.map(PinAnnotation.init))
+            view.addAnnotations(places.map { PinAnnotation($0, selected: $0.id == selectedID) })
+        } else if previous.selectedID != selectedID {
+            for case let pin as PinAnnotation in view.annotations {
+                let nowSelected = pin.recordID == selectedID
+                if pin.isSelected != nowSelected {
+                    pin.isSelected = nowSelected
+                    if let pinView = view.view(for: pin) as? PrecisionDotAnnotationView {
+                        pinView.configure(pin: pin)
+                    }
+                }
+            }
         }
         if firstUpdate || previous.digitalLocker != digitalLocker {
             view.removeAnnotations(view.annotations.filter { $0 is LockerAnnotation })
@@ -309,28 +387,36 @@ private struct StreetMap: UIViewRepresentable {
                 view.addAnnotation(LockerAnnotation(evidence: locker, point: point))
             }
         }
-        let selectedEstimate = placesChanged || previous.selectedID != selectedID
-            ? places.first { $0.id == selectedID && $0.entranceSideEstimate != nil }
-            : coordinator.selectedEstimate
-        if firstUpdate || previous.paths != paths || previous.route != route || coordinator.selectedEstimate != selectedEstimate {
+        let selectedPlace = placesChanged || previous.selectedID != selectedID
+            ? places.first { $0.id == selectedID }
+            : coordinator.selectedPlace
+        if firstUpdate || previous.paths != paths || previous.route != route || coordinator.selectedPlace != selectedPlace {
             view.removeOverlays(view.overlays)
             for path in paths {
                 let line = MKPolyline(coordinates: path.coordinates.map(\.cl),count: path.coordinates.count)
                 line.title = path.blocked ? "blocked" : path.confirmed ? "path" : "unconfirmed"; view.addOverlay(line)
             }
-            if let selectedEstimate, let estimate = selectedEstimate.entranceSideEstimate {
-                let region = MKCircle(center: selectedEstimate.coordinate.cl, radius: entranceSideSearchRadius(selectedEstimate))
-                region.title = "estimated-entry-region"; view.addOverlay(region)
-                if estimate.frontage.count >= 2 {
+            if let selectedPlace {
+                let isVerified = selectedPlace.verification == .fieldVerified && selectedPlace.entranceSideEstimate == nil
+                let zoneRadius = selectedPlace.entranceSideEstimate != nil
+                    ? entranceSideSearchRadius(selectedPlace)
+                    : (isVerified ? 6.5 : 9.0)
+                let region = MKCircle(center: selectedPlace.coordinate.cl, radius: zoneRadius)
+                region.title = isVerified ? "precision-zone-ready" : "estimated-entry-region"
+                view.addOverlay(region)
+                if let estimate = selectedPlace.entranceSideEstimate, estimate.frontage.count >= 2 {
                     let frontage = MKPolyline(coordinates: estimate.frontage.map(\.cl), count: estimate.frontage.count)
                     frontage.title = "estimated-entry-frontage"; view.addOverlay(frontage)
                 }
+                let core = MKCircle(center: selectedPlace.coordinate.cl, radius: min(2.2, max(1.0, zoneRadius * 0.45)))
+                core.title = isVerified ? "precision-core-ready" : "precision-core-selected"
+                view.addOverlay(core)
             }
             if !route.isEmpty {
                 let line = MKPolyline(coordinates: route.map(\.cl),count: route.count); line.title = "route"; view.addOverlay(line)
             }
         }
-        coordinator.selectedEstimate = selectedEstimate
+        coordinator.selectedPlace = selectedPlace
         coordinator.hasLoadedContent = true
         if firstUpdate || previous.userLocation != userLocation {
             coordinator.locationMarker.update(view, position: userLocation)
@@ -349,7 +435,7 @@ private struct StreetMap: UIViewRepresentable {
         var parent: StreetMap
         var hasLoadedContent = false
         let locationMarker = AppOwnedMapLocation()
-        var selectedEstimate: Place?
+        var selectedPlace: Place?
         var anchor: Coordinate?
         init(_ parent: StreetMap) { self.parent = parent }
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
@@ -361,13 +447,11 @@ private struct StreetMap: UIViewRepresentable {
                 view.canShowCallout = true; view.accessibilityIdentifier = "community.digitalLocker"
                 return view
             }
-            if let pin = annotation as? PinAnnotation, pin.isEntranceSideEstimate {
-                let view = (mapView.dequeueReusableAnnotationView(withIdentifier: "estimated-entry") as? MKMarkerAnnotationView)
-                    ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: "estimated-entry")
+            if let pin = annotation as? PinAnnotation {
+                let view = (mapView.dequeueReusableAnnotationView(withIdentifier: "precision-pin") as? PrecisionDotAnnotationView)
+                    ?? PrecisionDotAnnotationView(annotation: annotation, reuseIdentifier: "precision-pin")
                 view.annotation = annotation
-                view.markerTintColor = .systemOrange; view.glyphImage = UIImage(systemName: "exclamationmark.triangle.fill")
-                view.canShowCallout = true
-                view.accessibilityLabel = [pin.title, pin.subtitle].compactMap { $0 }.joined(separator: ". ")
+                view.configure(pin: pin)
                 return view
             }
             guard let position = annotation as? AppLocationAnnotation else { return nil }
@@ -385,18 +469,38 @@ private struct StreetMap: UIViewRepresentable {
             if let pin = view.annotation as? PinAnnotation { parent.onSelect(pin.recordID) }
         }
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            if let region = overlay as? MKCircle, region.title == "estimated-entry-region" {
-                let renderer = MKCircleRenderer(circle: region)
-                renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.12)
-                renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.7)
-                renderer.lineWidth = 1; renderer.lineDashPattern = [4,3]
+            if let circle = overlay as? MKCircle {
+                let renderer = MKCircleRenderer(circle: circle)
+                switch circle.title ?? "" {
+                case "precision-core-selected":
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.50)
+                    renderer.strokeColor = UIColor(red: 1.0, green: 0.45, blue: 0.0, alpha: 1.0)
+                    renderer.lineWidth = 2.2
+                case "precision-core-ready":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.52)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(1.0)
+                    renderer.lineWidth = 2.2
+                case "precision-zone-ready":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.22)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.92)
+                    renderer.lineWidth = 2.0
+                    renderer.lineDashPattern = [6, 4]
+                default:
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.20)
+                    renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.92)
+                    renderer.lineWidth = 2.0
+                    renderer.lineDashPattern = [6, 4]
+                }
                 return renderer
             }
             guard let line = overlay as? MKPolyline else { return MKOverlayRenderer(overlay: overlay) }
-            let renderer = MKPolylineRenderer(polyline: line); renderer.lineWidth = line.title == "route" ? 6 : 3
-            renderer.strokeColor = line.title == "route" ? .systemMint : line.title == "blocked" ? .systemRed : .systemOrange
+            let renderer = MKPolylineRenderer(polyline: line)
+            renderer.lineCap = .round
+            renderer.lineJoin = .round
+            renderer.lineWidth = line.title == "route" ? 6 : (line.title == "estimated-entry-frontage" ? 4.2 : 3)
+            renderer.strokeColor = line.title == "route" ? .systemMint : line.title == "blocked" ? .systemRed : UIColor(red: 1.0, green: 0.44, blue: 0.0, alpha: 0.96)
             if line.title == "unconfirmed" { renderer.lineDashPattern = [5,5] }
-            if line.title == "estimated-entry-frontage" { renderer.lineDashPattern = [4,3] }
+            if line.title == "estimated-entry-frontage" { renderer.lineDashPattern = [7,3] }
             return renderer
         }
         @objc func pin(_ gesture: UILongPressGestureRecognizer) {

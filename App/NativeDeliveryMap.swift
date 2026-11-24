@@ -261,20 +261,52 @@ struct NativeDeliveryMap: UIViewRepresentable {
             let current = Dictionary(uniqueKeysWithValues: parent.pins.map { ($0.id, $0) })
             for id in Array(overlays.keys) {
                 let a = old[id], b = current[id]
-                if a?.coordinate != b?.coordinate || a?.radius != b?.radius || a?.frontage != b?.frontage || b == nil {
+                if a?.coordinate != b?.coordinate || a?.radius != b?.radius || a?.frontage != b?.frontage ||
+                    a?.selected != b?.selected || a?.ready != b?.ready || a?.completed != b?.completed || b == nil {
                     if let removed = overlays.removeValue(forKey: id) { view.removeOverlays(removed) }
                 }
             }
-            for pin in parent.pins where pin.radius > 0 && overlays[pin.id] == nil {
-                let circle = MKCircle(center: pin.coordinate.cl, radius: pin.radius)
-                var additions: [MKOverlay] = [circle]
+            // Add unselected stops first so the selected stop's deeper highlight renders on top.
+            let orderedPins = parent.pins.filter { $0.radius > 0 && overlays[$0.id] == nil }
+                .sorted { !$0.selected && $1.selected }
+            for pin in orderedPins {
+                let zone = MKCircle(center: pin.coordinate.cl, radius: pin.radius)
+                zone.title = zoneOverlayTitle(for: pin)
+                var additions: [MKOverlay] = [zone]
+
                 if pin.frontage.count >= 2 {
                     let line = MKPolyline(coordinates: pin.frontage.map(\.cl), count: pin.frontage.count)
+                    line.title = frontageOverlayTitle(for: pin)
                     additions.append(line)
                 }
+
+                if !pin.completed {
+                    let coreRadius = min(2.2, max(1.0, pin.radius * 0.45))
+                    let core = MKCircle(center: pin.coordinate.cl, radius: coreRadius)
+                    core.title = coreOverlayTitle(for: pin)
+                    additions.append(core)
+                }
+
                 overlays[pin.id] = additions
                 view.addOverlays(additions)
             }
+        }
+
+        private func zoneOverlayTitle(for pin: Pin) -> String {
+            if pin.completed { return "zone-completed" }
+            if pin.ready { return pin.selected ? "zone-ready-selected" : "zone-ready" }
+            return pin.selected ? "zone-selected" : "zone"
+        }
+
+        private func coreOverlayTitle(for pin: Pin) -> String {
+            if pin.ready { return pin.selected ? "core-ready-selected" : "core-ready" }
+            return pin.selected ? "core-selected" : "core"
+        }
+
+        private func frontageOverlayTitle(for pin: Pin) -> String {
+            if pin.completed { return "frontage-completed" }
+            if pin.ready { return pin.selected ? "frontage-ready-selected" : "frontage-ready" }
+            return pin.selected ? "frontage-selected" : "frontage"
         }
 
         private func applyCamera(_ view: MKMapView, refit: Bool = false) {
@@ -438,15 +470,81 @@ struct NativeDeliveryMap: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let circle = overlay as? MKCircle {
                 let renderer = MKCircleRenderer(circle: circle)
-                renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.12)
-                renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.55)
-                renderer.lineWidth = 1; renderer.lineDashPattern = [4, 3]
+                switch circle.title ?? "" {
+                case "core-selected":
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.50)
+                    renderer.strokeColor = UIColor(red: 1.0, green: 0.45, blue: 0.0, alpha: 1.0)
+                    renderer.lineWidth = 2.2
+                case "core":
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.38)
+                    renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.92)
+                    renderer.lineWidth = 1.8
+                case "core-ready-selected":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.52)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(1.0)
+                    renderer.lineWidth = 2.2
+                case "core-ready":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.40)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.92)
+                    renderer.lineWidth = 1.8
+                case "zone-selected":
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.22)
+                    renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.95)
+                    renderer.lineWidth = 2.2
+                    renderer.lineDashPattern = [6, 4]
+                case "zone-ready-selected":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.24)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.95)
+                    renderer.lineWidth = 2.2
+                    renderer.lineDashPattern = [6, 4]
+                case "zone-ready":
+                    renderer.fillColor = UIColor.systemTeal.withAlphaComponent(0.13)
+                    renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.72)
+                    renderer.lineWidth = 1.6
+                    renderer.lineDashPattern = [5, 4]
+                case "zone-completed":
+                    renderer.fillColor = UIColor.systemGray.withAlphaComponent(0.07)
+                    renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.35)
+                    renderer.lineWidth = 1.2
+                    renderer.lineDashPattern = [4, 4]
+                default:
+                    renderer.fillColor = UIColor.systemOrange.withAlphaComponent(0.12)
+                    renderer.strokeColor = UIColor.systemOrange.withAlphaComponent(0.68)
+                    renderer.lineWidth = 1.6
+                    renderer.lineDashPattern = [5, 4]
+                }
                 return renderer
             }
             guard let line = overlay as? MKPolyline else { return MKOverlayRenderer(overlay: overlay) }
             let renderer = MKPolylineRenderer(polyline: line)
-            renderer.strokeColor = line.title == "stop-order" ? UIColor.systemTeal.withAlphaComponent(0.75) : UIColor.systemOrange.withAlphaComponent(0.8)
-            renderer.lineWidth = 3; renderer.lineDashPattern = line.title == "stop-order" ? [6, 5] : [4, 3]
+            renderer.lineCap = .round
+            renderer.lineJoin = .round
+            switch line.title ?? "" {
+            case "stop-order":
+                renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.75)
+                renderer.lineWidth = 3
+                renderer.lineDashPattern = [6, 5]
+            case "frontage-selected":
+                renderer.strokeColor = UIColor(red: 1.0, green: 0.44, blue: 0.0, alpha: 0.96)
+                renderer.lineWidth = 4.5
+                renderer.lineDashPattern = [7, 3]
+            case "frontage-ready-selected":
+                renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.96)
+                renderer.lineWidth = 4.5
+                renderer.lineDashPattern = [7, 3]
+            case "frontage-ready":
+                renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.88)
+                renderer.lineWidth = 3.5
+                renderer.lineDashPattern = [6, 3]
+            case "frontage-completed":
+                renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.45)
+                renderer.lineWidth = 2.2
+                renderer.lineDashPattern = [5, 4]
+            default:
+                renderer.strokeColor = UIColor(red: 1.0, green: 0.50, blue: 0.0, alpha: 0.90)
+                renderer.lineWidth = 3.5
+                renderer.lineDashPattern = [6, 3]
+            }
             return renderer
         }
     }

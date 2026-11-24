@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Keep the tip at the view's bottom center, matching Annotation's .bottom anchor.
+/// Keep the precision anchor at the view's bottom center, matching Annotation's .bottom anchor.
 struct DeliveryMapPin: View {
     let sequence: String
     let unit: String
@@ -11,45 +11,110 @@ struct DeliveryMapPin: View {
     var referenceLabel: String? = nil
     var referenceDisclaimer: String? = nil
 
-    var body: some View {
-        VStack(spacing: 2) {
-            HStack(spacing: 4) {
-                if estimated { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow) }
-                Text(referenceLabel ?? (building.isEmpty ? unit : "\(unit) · B\(building)"))
-            }
-                .font(.caption.bold()).foregroundStyle(.white)
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .background(.black.opacity(0.92), in: Capsule())
-                .overlay(Capsule().stroke(.white.opacity(selected ? 1 : 0.6), lineWidth: selected ? 2 : 1))
-            if let referenceDisclaimer { Text(referenceDisclaimer).font(.caption2.bold()).padding(3).background(.regularMaterial, in: Capsule()) }
-            DeliveryPinShape()
-                .fill(color)
-                .overlay(DeliveryPinShape().stroke(.black.opacity(0.9), lineWidth: 5))
-                .overlay(DeliveryPinShape().stroke(.white, lineWidth: 2))
-                .overlay(alignment: .top) {
-                    Text(sequence).font(.caption2.bold()).monospacedDigit()
-                        .foregroundStyle(.black).lineLimit(1).minimumScaleFactor(0.6)
-                        .frame(width: 18, height: 18).background(.white, in: Circle())
-                        .padding(.top, 7)
-                }
-                .frame(width: 32, height: 44).clipped()
-        }
-        .fixedSize().frame(minWidth: 44).contentShape(Rectangle())
+    private var primaryLabel: String {
+        referenceLabel ?? (building.isEmpty ? unit : "\(unit) · B\(building)")
     }
-}
 
-private struct DeliveryPinShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-            CGPoint(x: rect.minX + x * rect.width, y: rect.minY + y * rect.height)
+    private var isMuted: Bool { color == .gray }
+    private var badgeForeground: Color { isMuted ? .white : .black }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 5) {
+                Text(sequence)
+                    .font(.caption2.bold())
+                    .monospacedDigit()
+                    .foregroundStyle(badgeForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                    .padding(.horizontal, 1.5)
+                    .frame(width: 20, height: 20)
+                    .background(
+                        Circle()
+                            .fill(color)
+                            .overlay(
+                                Circle().stroke(Color.white.opacity(selected ? 0.95 : 0.65), lineWidth: 1)
+                            )
+                    )
+                if estimated {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.yellow)
+                }
+                Text(primaryLabel)
+                    .font(.caption.bold())
+                    .foregroundStyle(Color.white.opacity(isMuted && !selected ? 0.82 : 1.0))
+                    .lineLimit(1)
+            }
+            .padding(.leading, 4)
+            .padding(.trailing, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(selected ? 0.96 : (isMuted ? 0.80 : 0.90)))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        selected ? color : Color.white.opacity(isMuted ? 0.35 : 0.58),
+                        lineWidth: selected ? 2.2 : 1.0
+                    )
+            )
+            .shadow(color: Color.black.opacity(selected ? 0.55 : 0.38), radius: selected ? 4 : 2.5, x: 0, y: 1.5)
+
+            if let referenceDisclaimer {
+                Text(referenceDisclaimer)
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.top, 2)
+            }
+
+            // Hairline pointer stem into a deeper, high-precision anchor target dot.
+            // Constant layout height keeps bounds identical across selection changes (zero MapKit jitter).
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Color.black.opacity(isMuted && !selected ? 0.60 : 0.85))
+                    .frame(width: 4, height: 14)
+                    .overlay {
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [selected ? color : Color.white.opacity(isMuted ? 0.70 : 0.95), color],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .frame(width: selected ? 2.2 : 1.8, height: 12)
+                    }
+
+                ZStack {
+                    Circle()
+                        .fill(Color.black.opacity(selected ? 0.88 : (isMuted ? 0.58 : 0.75)))
+                        .frame(width: 12, height: 12)
+                    Circle()
+                        .fill(Color.white.opacity(isMuted && !selected ? 0.85 : 1.0))
+                        .frame(width: 10, height: 10)
+                    Circle()
+                        .fill(color)
+                        .frame(width: selected ? 7 : 6.5, height: selected ? 7 : 6.5)
+                }
+                .background {
+                    if selected {
+                        Circle()
+                            .fill(color.opacity(0.30))
+                            .overlay(Circle().stroke(color.opacity(0.95), lineWidth: 1.5))
+                            .frame(width: 16, height: 16)
+                    }
+                }
+                .frame(width: 18, height: 12)
+                .padding(.top, 10)
+            }
+            .frame(height: 22)
         }
-        var path = Path()
-        path.move(to: point(0.5, 1))
-        path.addCurve(to: point(0.09, 0.36), control1: point(0.32, 0.8), control2: point(0.09, 0.6))
-        path.addCurve(to: point(0.5, 0.07), control1: point(0.09, 0.2), control2: point(0.27, 0.07))
-        path.addCurve(to: point(0.91, 0.36), control1: point(0.73, 0.07), control2: point(0.91, 0.2))
-        path.addCurve(to: point(0.5, 1), control1: point(0.91, 0.6), control2: point(0.68, 0.8))
-        path.closeSubpath()
-        return path
+        .fixedSize()
+        .frame(minWidth: 44)
+        .contentShape(Rectangle())
     }
 }
