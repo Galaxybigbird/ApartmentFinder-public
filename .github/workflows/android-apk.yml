@@ -1,0 +1,114 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Run Android Kotlin unit tests
+        run: gradle -p android testDebugUnitTest --stacktrace
+
+      - name: Prepare release signing keystore
+        run: |
+          set -euo pipefail
+          KEYSTORE_PATH="$RUNNER_TEMP/apartmentfinder-release.jks"
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
+            printf '%s' "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 --decode > "$KEYSTORE_PATH"
+            echo "ANDROID_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_PATH" \
+              -storetype PKCS12 \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -alias apartmentfinder \
+              -storepass apartmentfinder \
+              -keypass apartmentfinder \
+              -dname "CN=ApartmentFinder, OU=Mobile, O=Galaxybigbird, L=Las Vegas, ST=NV, C=US"
+            echo "ANDROID_KEYSTORE_PASSWORD=apartmentfinder" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=apartmentfinder" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_PASSWORD=apartmentfinder" >> "$GITHUB_ENV"
+          fi
+          echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        run: gradle -p android assembleRelease --stacktrace
+
+      - name: Verify APK signature and package release asset
+        run: |
+          set -euo pipefail
+          APK_IN="android/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK_IN"
+          APKSIGNER="$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)"
+          "$APKSIGNER" verify --verbose "$APK_IN"
+          mkdir -p dist-android
+          cp "$APK_IN" "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk"
+          sha256sum "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk" > "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk.sha256"
+          ls -lh dist-android/
+
+      - name: Upload APK workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApartmentFinder-Android-APK
+          path: dist-android/*
+          if-no-files-found: error
+
+      - name: Publish downloadable APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="android-v0.1.0-31.1"
+          NOTES="Native Android build of ApartmentFinder (0.1.0 · parity with iOS Build 31.1).
+
+          ### Highlights
+          - Auto-syncs the live Las Vegas Valley **Wave 35+** catalog (**2,430 communities · 348,770 precision pins across 65 ZIPs**) via streaming gzip SQLite ingest.
+          - **Zero plain teardrop pins** — full Latigo/Lyric-inspired MapLibre GL satellite + street precision pins (outer geodesic building zone, 2.2 m solid inner core, wall frontage highlight lines, floating dark-glass capsules + target anchor dots).
+          - Full OnTrac 6-column CSV / sub-stop ranking + multi-day ZIP manifest import (file picker & Android Share Sheet).
+          - Mini-Route active delivery map, Check / Correct Door Pin satellite editor, Google Maps walking handoff, Finder tab, Digital Locker badges, and JSON backup export/restore.
+
+          ### Install on Android
+          1. Tap **ApartmentFinder-Android-0.1.0-31.1.apk** below to download on your phone.
+          2. Open the downloaded file and tap **Install** (allow *Install unknown apps* if prompted).
+          3. Launch ApartmentFinder — it automatically downloads and indexes the live Las Vegas Valley pin catalog on first run."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk" \
+              "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk.sha256" \
+              --clobber
+            gh release edit "$TAG" --title "ApartmentFinder Android 0.1.0 (Build 31.1)" --notes "$NOTES"
+          else
+            gh release create "$TAG" \
+              "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk" \
+              "dist-android/ApartmentFinder-Android-0.1.0-31.1.apk.sha256" \
+              --title "ApartmentFinder Android 0.1.0 (Build 31.1)" \
+              --notes "$NOTES"
+          fi
