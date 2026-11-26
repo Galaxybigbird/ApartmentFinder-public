@@ -227,13 +227,14 @@ public enum PublicCatalogSupplement {
         // SQLite place reads enforce the exact same admission rules as `applying(_:to:)`.
         let baseSources = Dictionary((base?.catalog.sources ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let publicSources = Dictionary(catalog.sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let conflictingSources = Set(catalog.sources.compactMap { source in
+        let conflictingSources: Set<String> = Set(catalog.sources.compactMap { source -> String? in
             guard let existing = baseSources[source.id], existing != source else { return nil }
             return source.id
         })
         let usableSourceIDs = Set(publicSources.keys).subtracting(conflictingSources)
 
         let baseCommunities = Dictionary((base?.catalog.communities ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let publicCommunitiesByID = Dictionary(catalog.communities.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var addressOwners: [String: Set<String>] = [:]
         for community in (base?.catalog.communities ?? []) + catalog.communities {
             for address in community.matchingAddresses {
@@ -242,7 +243,7 @@ public enum PublicCatalogSupplement {
         }
         var admittedAddressKeys: [String: Set<String>] = [:]
         for community in result.catalog.communities {
-            if let pub = catalog.communities.first(where: { $0.id == community.id }) {
+            if let pub = publicCommunitiesByID[community.id] {
                 let key = LocalSearch.addressKey(pub.address)
                 guard !key.isEmpty, addressOwners[key]?.count == 1,
                       !pub.sourceIDs.isEmpty, pub.sourceIDs.allSatisfy(usableSourceIDs.contains) else { continue }
