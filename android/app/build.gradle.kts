@@ -12,8 +12,8 @@ android {
         applicationId = "dev.galaxybigbird.apartmentfinder"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3101
-        versionName = "0.1.0-31.1"
+        versionCode = 3201
+        versionName = "0.1.0-32.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

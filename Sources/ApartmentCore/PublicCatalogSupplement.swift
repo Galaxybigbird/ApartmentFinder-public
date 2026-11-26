@@ -121,15 +121,26 @@ public enum PublicCatalogSupplement {
             pointIDs.insert(point.id)
             neededSources.formUnion(point.sourceIDs)
         }
-        // Preserve first-record precedence without rescanning every unit for each reference.
-        let placesByID = Dictionary(result.places.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let publicPlacesByID = Dictionary(supplement.places.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // Only index places referenced by unitBuildingAssociations instead of copying all 355k+ places into two huge Dictionaries.
+        let publicAssociations = supplement.catalog.unitBuildingAssociations ?? []
+        let neededReferenceIDs = Set(publicAssociations.compactMap(\.referencePlaceID))
+        var placesByID: [String: Place] = [:]
+        var publicPlacesByID: [String: Place] = [:]
+        if !neededReferenceIDs.isEmpty {
+            placesByID.reserveCapacity(neededReferenceIDs.count)
+            publicPlacesByID.reserveCapacity(neededReferenceIDs.count)
+            for place in result.places where neededReferenceIDs.contains(place.id) && placesByID[place.id] == nil {
+                placesByID[place.id] = place
+            }
+            for place in supplement.places where neededReferenceIDs.contains(place.id) && publicPlacesByID[place.id] == nil {
+                publicPlacesByID[place.id] = place
+            }
+        }
         var associations = result.catalog.unitBuildingAssociations ?? []
         let baseAssociationKeysByID = Dictionary(associations.map { ($0.id, associationKey($0)) }, uniquingKeysWith: { first, _ in first })
         var associationIDs = Set(associations.map(\.id))
         var associationKeys = Set(associations.map(associationKey))
         let indexesByKey = Dictionary(grouping: associations.indices, by: { associationKey(associations[$0]) })
-        let publicAssociations = supplement.catalog.unitBuildingAssociations ?? []
         let publicKeyCounts = Dictionary(grouping: publicAssociations, by: associationKey).mapValues(\.count)
         for a in publicAssociations {
             guard let community = admitted[a.communityID], usableSources(a.sourceIDs),

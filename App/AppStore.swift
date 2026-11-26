@@ -263,14 +263,20 @@ final class AppStore: ObservableObject {
             publicCatalogUpdateStatus = "The previous pin data could not be restored. The installed map remains available offline."
         }
     }
-    // The store verifies its generation bytes here. Keep that disk work on the
-    // same worker that installed the update or restored the previous generation.
+    // The store verifies its generation digests here without re-decoding 200+ MB GeoJSON.
     private nonisolated static func reviewedBundleAllowed(in store: PublicCatalogUpdateStore,
                                                           for selected: PublicCatalogUpdateSelection) -> Bool {
-        let snapshot = try? store.reviewedBundleSelection()
-        return snapshot?.bundleAllowed == true && snapshot?.selection?.manifest == selected.manifest
+        store.isReviewedBundleAllowed(for: selected.manifest)
     }
     private func applyPublicCatalog(_ selected: PublicCatalogUpdateSelection, bundleAllowed eligible: Bool) {
+        // Release old 350k+ place caches before indexing the newly installed catalog so peak RAM stays flat.
+        mergedPlaces.removeAll(keepingCapacity: false)
+        apartmentPlacesByCommunity.removeAll(keepingCapacity: false)
+        scopedApartmentPlaces.removeAll(keepingCapacity: false)
+        cachedDoorMatches.removeAll(keepingCapacity: false)
+        pack = nil
+        publicOwnershipView = nil
+        publicCatalogSupplement = nil
         let baseline = reviewedBaseline
         reviewedOverlayAllowed = eligible && reviewedOverlay != nil && baseline != nil &&
             (selected.manifest.sequence > baseline!.manifest.sequence || selected.manifest.sequence < baseline!.manifest.sequence || selected.manifest == baseline!.manifest)

@@ -92,12 +92,40 @@ final class PublicCatalogUpdateTests: XCTestCase {
             }
             XCTAssertThrowsError(try PublicCatalogUpdatePayload(manifestData: manifest(changed), files: changed), field)
         }
-        var checked = good
-        checked["public-locations.geojson"] = try mutate(good["public-locations.geojson"]!) { root in
+        let checked = good
+        var checkedMut = checked
+        checkedMut["public-locations.geojson"] = try mutate(good["public-locations.geojson"]!) { root in
             var features = root["features"] as! [[String: Any]], properties = features[0]["properties"] as! [String: Any]
             properties["verification"] = "fieldVerified"; properties["kind"] = "door"; features[0]["properties"] = properties; root["features"] = features
         }
-        XCTAssertThrowsError(try PublicCatalogUpdatePayload(manifestData: manifest(checked), files: checked))
+        XCTAssertThrowsError(try PublicCatalogUpdatePayload(manifestData: manifest(checkedMut), files: checkedMut))
+        // Streaming admission must also reject null-valued private fields and non-boolean entranceSideEstimate flags.
+        var nullPrivate = good
+        nullPrivate["public-locations.geojson"] = try mutate(good["public-locations.geojson"]!) { root in
+            var features = root["features"] as! [[String: Any]], properties = features[0]["properties"] as! [String: Any]
+            properties["gateCode"] = NSNull(); features[0]["properties"] = properties; root["features"] = features
+        }
+        XCTAssertThrowsError(try PublicCatalogUpdatePayload(manifestData: manifest(nullPrivate), files: nullPrivate))
+        var badEstimate = good
+        badEstimate["public-locations.geojson"] = try mutate(good["public-locations.geojson"]!) { root in
+            var features = root["features"] as! [[String: Any]], properties = features[0]["properties"] as! [String: Any]
+            properties["verification"] = "estimated"
+            properties["identityUncertain"] = true
+            properties["entranceSideEstimate"] = [
+                "frontage": [["latitude": 0.0, "longitude": 0.0], ["latitude": 0.0, "longitude": 0.0001]],
+                "workingAllowanceMeters": 6,
+                "uncertaintyCalibrated": 0,
+                "doorCoordinatesVerified": false,
+                "entranceCoordinatesVerified": false,
+                "physicalSignageVerified": false,
+                "dwellingFloorEvidence": "unknown",
+                "entryLevelDescription": "Wall",
+                "sharedUnits": [],
+                "evidenceNotes": "Synthetic"
+            ] as [String: Any]
+            features[0]["properties"] = properties; root["features"] = features
+        }
+        XCTAssertThrowsError(try PublicCatalogUpdatePayload(manifestData: manifest(badEstimate), files: badEstimate))
     }
 
     func testPublicThreeMegabyteCatalogBudgetDoesNotExpandPrivateImportBudget() throws {

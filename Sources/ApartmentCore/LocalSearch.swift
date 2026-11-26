@@ -1,7 +1,8 @@
 import Foundation
 public enum LocalSearch {
     // A locality suffix needs a delimiter or state/ZIP context; city words can be street names.
-    static let localitySuffixPattern = #"(?i)(?:[,\.\r\n]+\s*(?:las\s+vegas|henderson)(?:[,\s.]+(?:nv|nevada))?(?:[,\s.]+\d{5}(?:-\d{4})?)?|[,\s.]+(?:las\s+vegas|henderson)[,\s.]+(?:(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?|\d{5}(?:-\d{4})?)|[,\s.]+(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?)[,\s.]*$"#
+    // Longer multi-word names (e.g. North Las Vegas) come before Las Vegas so "North" is never left dangling.
+    static let localitySuffixPattern = #"(?i)(?:[,\.\r\n]+\s*(?:north\s+las\s+vegas|n\.?\s+las\s+vegas|las\s+vegas|henderson|boulder\s+city|blue\s+diamond|nellis\s+afb|spring\s+valley|sunrise\s+manor|enterprise|paradise|whitney|winchester|summerlin(?:\s+south)?)(?:[,\s.]+(?:nv|nevada))?(?:[,\s.]+\d{5}(?:-\d{4})?)?|[,\s.]+(?:north\s+las\s+vegas|n\.?\s+las\s+vegas|las\s+vegas|henderson|boulder\s+city|blue\s+diamond|nellis\s+afb|spring\s+valley|sunrise\s+manor|enterprise|paradise|whitney|winchester|summerlin(?:\s+south)?)[,\s.]+(?:(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?|\d{5}(?:-\d{4})?)|[,\s.]+(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?)[,\s.]*$"#
     public static func normalized(_ value: String) -> String {
         value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -31,8 +32,27 @@ public enum LocalSearch {
         }
     }
     public static func merged(seed: [Place], overrides: [Place]) -> [Place] {
-        var values = Dictionary(seed.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        for value in overrides { values[value.id] = value }
-        return values.values.sorted { $0.id < $1.id }
+        if overrides.isEmpty {
+            var seen = Set<String>()
+            seen.reserveCapacity(seed.count)
+            var unique: [Place] = []
+            unique.reserveCapacity(seed.count)
+            for value in seed.reversed() where seen.insert(value.id).inserted {
+                unique.append(value)
+            }
+            return unique.sorted { $0.id < $1.id }
+        }
+        var overrideMap: [String: Place] = [:]
+        overrideMap.reserveCapacity(overrides.count)
+        for value in overrides { overrideMap[value.id] = value }
+        var seen = Set<String>()
+        seen.reserveCapacity(seed.count + overrideMap.count)
+        var result: [Place] = []
+        result.reserveCapacity(seed.count + overrideMap.count)
+        for value in seed.reversed() where seen.insert(value.id).inserted {
+            result.append(overrideMap.removeValue(forKey: value.id) ?? value)
+        }
+        for value in overrideMap.values { result.append(value) }
+        return result.sorted { $0.id < $1.id }
     }
 }

@@ -14,8 +14,9 @@ import kotlin.math.sqrt
  */
 object LocalSearch {
     // A locality suffix needs a delimiter or state/ZIP context; city words can be street names.
+    // Longer multi-word names (North Las Vegas / N Las Vegas) come before Las Vegas so "North" is never left dangling.
     val localitySuffixRegex = Regex(
-        """(?i)(?:[,\.\r\n]+\s*(?:las\s+vegas|henderson|north\s+las\s+vegas)(?:[,\s.]+(?:nv|nevada))?(?:[,\s.]+\d{5}(?:-\d{4})?)?|[,\s.]+(?:las\s+vegas|henderson|north\s+las\s+vegas)[,\s.]+(?:(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?|\d{5}(?:-\d{4})?)|[,\s.]+(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?)[,\s.]*$"""
+        """(?i)(?:[,\.\r\n]+\s*(?:north\s+las\s+vegas|n\.?\s+las\s+vegas|las\s+vegas|henderson|boulder\s+city|blue\s+diamond|nellis\s+afb|spring\s+valley|sunrise\s+manor|enterprise|paradise|whitney|winchester|summerlin(?:\s+south)?)(?:[,\s.]+(?:nv|nevada))?(?:[,\s.]+\d{5}(?:-\d{4})?)?|[,\s.]+(?:north\s+las\s+vegas|n\.?\s+las\s+vegas|las\s+vegas|henderson|boulder\s+city|blue\s+diamond|nellis\s+afb|spring\s+valley|sunrise\s+manor|enterprise|paradise|whitney|winchester|summerlin(?:\s+south)?)[,\s.]+(?:(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?|\d{5}(?:-\d{4})?)|[,\s.]+(?:nv|nevada)(?:[,\s.]+\d{5}(?:-\d{4})?)?)[,\s.]*$"""
     )
     private val trailingPostalRegex = Regex("""\s+\d{5}(-\d{4})?$""")
     private val nonAlnumRegex = Regex("""[^a-z0-9]+""")

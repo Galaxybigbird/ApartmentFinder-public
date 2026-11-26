@@ -9,6 +9,18 @@ import Compression
 import zlib
 #endif
 
+#if canImport(ObjectiveC)
+@inline(__always)
+func withAutoreleasePool<T>(_ body: () throws -> T) rethrows -> T {
+    try autoreleasepool(invoking: body)
+}
+#else
+@inline(__always)
+func withAutoreleasePool<T>(_ body: () throws -> T) rethrows -> T {
+    try body()
+}
+#endif
+
 /// Public facts only. These limits do not change the separate private import budget.
 public struct PublicCatalogUpdateManifest: Codable, Sendable, Equatable {
     public struct FileDescriptor: Codable, Sendable, Equatable {
@@ -98,7 +110,9 @@ public struct PublicCatalogUpdatePayload: Sendable {
             }
         }
         try PublicCatalogUpdateAdmission.validate(files)
-        let pack = try LocalDataPack.read(catalog: files["public-catalog.json"]!, locations: files["public-locations.geojson"]!, paths: files["public-paths.geojson"]!)
+        let pack: LocalDataPack = try withAutoreleasePool {
+            try LocalDataPack.read(catalog: files["public-catalog.json"]!, locations: files["public-locations.geojson"]!, paths: files["public-paths.geojson"]!)
+        }
         guard pack.catalog.packVersion == manifest.packVersion, !pack.catalog.communities.isEmpty, !pack.places.isEmpty else {
             throw CoreError("The public catalog payload has no matching usable catalog.")
         }
@@ -230,7 +244,6 @@ enum PublicCatalogGzip {
         }
         #if canImport(Compression)
         var output = Data()
-        output.reserveCapacity(min(expectedBytes, 4_194_304))
         let expectedCRC: UInt32 = try compressed.withUnsafeBytes { rawInput in
             let bytes = rawInput.bindMemory(to: UInt8.self)
             guard let base = bytes.baseAddress else { throw CoreError("Invalid gzip buffer.") }
@@ -241,6 +254,8 @@ enum PublicCatalogGzip {
             guard isize == UInt32(truncatingIfNeeded: expectedBytes) else {
                 throw CoreError("Gzip trailer size does not match manifest.")
             }
+            // Reserve exact verified output size to avoid 256MB -> 512MB Data growth spikes on iOS.
+            output.reserveCapacity(expectedBytes)
 
             let streamPtr = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
             defer { streamPtr.deallocate() }

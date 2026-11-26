@@ -33,9 +33,23 @@ public struct DataPackPayload: Sendable {
         guard values.isDirectory == true, values.isSymbolicLink != true else { throw CoreError("Choose a regular map-pack folder.") }
     }
     static func boundedData(_ url: URL, maximum: Int) throws -> Data {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= maximum else { throw CoreError("A map-pack file is missing, unsupported or too large.") }
         var bytes = Data()
+        if size > 0 { bytes.reserveCapacity(size) }
         _ = try visitBoundedFile(url, maximum: maximum) { bytes.append($0) }
         return bytes
+    }
+    /// Memory-maps immutable verified generation files so large GeoJSON payloads stay clean instead of consuming dirty RAM.
+    static func mappedBoundedData(_ url: URL, maximum: Int) throws -> Data {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= maximum else { throw CoreError("A map-pack file is missing, unsupported or too large.") }
+        if size <= 4_000_000 { return try boundedData(url, maximum: maximum) }
+        let mapped = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard mapped.count == size, mapped.count <= maximum else { throw CoreError("A map-pack file is missing, unsupported or too large.") }
+        return mapped
     }
     static func visitBoundedFile(_ url: URL, maximum: Int, consume: (Data) throws -> Void) throws -> Int {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])

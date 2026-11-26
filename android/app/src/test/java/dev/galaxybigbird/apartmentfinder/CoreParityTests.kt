@@ -25,6 +25,14 @@ class CoreParityTests {
             LocalSearch.addressKey("4425 W. Rome Boulevard, North Las Vegas, NV 89084")
         )
         assertEquals(
+            "6500 n 5th st",
+            LocalSearch.addressKey("6500 N 5th St, N. Las Vegas, NV 89084")
+        )
+        assertEquals(
+            "1330 georgia ave",
+            LocalSearch.addressKey("1330 Georgia Ave, Boulder City, NV 89005")
+        )
+        assertEquals(
             "200 s green valley pkwy",
             LocalSearch.addressKey("200 South Green Valley Parkway, Henderson, NV 89012")
         )

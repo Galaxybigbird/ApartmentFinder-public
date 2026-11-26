@@ -17,10 +17,18 @@ final class ManifestTests: XCTestCase {
         let longUnit = DeliveryAddress.resolve("1200 FICTIONAL COURTYARD WAY 04102. LAS VEGAS. NV. 89113", knownAddresses: [street])
         XCTAssertEqual(longUnit.unit, "04102")
         XCTAssertEqual(longUnit.address, street)
-        for suffix in [".Henderson.NV.89052", ", Henderson, NV 89014", " Henderson Nevada 89044-1234"] {
+        for suffix in [".Henderson.NV.89052", ", Henderson, NV 89014", " Henderson Nevada 89044-1234",
+                       " NORTH LAS VEGAS NV 89084", ", NORTH LAS VEGAS, NV 89084", ". NORTH LAS VEGAS. NV. 89084",
+                       ", N LAS VEGAS, NV 89084", ", N. Las Vegas, NV 89086", ", Boulder City, NV 89005"] {
             let parsed = DeliveryAddress.resolve(street + " 04102" + suffix, knownAddresses: [street])
-            XCTAssertEqual(parsed.address, street)
-            XCTAssertEqual(parsed.unit, "04102")
+            XCTAssertEqual(parsed.address, street, suffix)
+            XCTAssertEqual(parsed.unit, "04102", suffix)
+        }
+        let nlvExplicit = DeliveryAddress.resolve("1200 FICTIONAL COURTYARD WAY APT 1010 NORTH LAS VEGAS NV 89084", knownAddresses: [street])
+        XCTAssertEqual(nlvExplicit.address, street)
+        XCTAssertEqual(nlvExplicit.unit, "1010")
+        for streetWithCityWord in ["4350 Paradise Rd", "625 Whitney Ranch Dr", "6964 Blue Diamond Rd", "5600 Boulder Hwy"] {
+            XCTAssertEqual(LocalSearch.addressKey(streetWithCityWord + ", Las Vegas, NV 89123"), LocalSearch.addressKey(streetWithCityWord))
         }
         for namedStreet in ["100 Las Vegas Blvd", "100 Henderson Dr", "100 Nevada Ave"] {
             let parsed = DeliveryAddress.resolve(namedStreet + " 001\n001.Henderson.NV.89052", knownAddresses: [namedStreet])

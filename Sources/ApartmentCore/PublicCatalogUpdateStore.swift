@@ -59,6 +59,14 @@ public struct PublicCatalogUpdateStore: Sendable {
         return (selection, state.rejectedRevisions.isEmpty && !value.recovered &&
             state.highestSequence == value.reference.sequence)
     }
+    /// Lightweight metadata-only eligibility check (verifies generation digests without reloading 200+ MB GeoJSON).
+    public func isReviewedBundleAllowed(for manifest: PublicCatalogUpdateManifest) -> Bool {
+        Self.writer.lock(); defer { Self.writer.unlock() }
+        guard let (state, value) = try? resolve(fullPack: false) else { return false }
+        return state.rejectedRevisions.isEmpty && !value.recovered &&
+            state.highestSequence == value.reference.sequence &&
+            value.manifest == manifest
+    }
     public func knownAddresses() throws -> [String]? { try resolve(fullPack: false)?.1.index.addresses }
 
     /// Preflight avoids unchanged network downloads. An exact no-op also verifies the cached
@@ -80,7 +88,7 @@ public struct PublicCatalogUpdateStore: Sendable {
             guard let result = try load() else { throw CoreError("The selected public catalog is unavailable.") }
             return result
         }
-        let previous: Resolved? = oldState.flatMap { try? resolve($0, fullPack: true) }
+        let previous: Resolved? = oldState.flatMap { try? resolve($0, fullPack: false) }
         let rawCatalog = try JSONDecoder().decode(Catalog.self, from: payload.files["public-catalog.json"]!)
         let indexBytes = try KnownAddressIndex(catalog: rawCatalog).data()
         _ = try KnownAddressIndex.read(indexBytes)
@@ -104,9 +112,10 @@ public struct PublicCatalogUpdateStore: Sendable {
         try write(descriptorBytes, to: generation.appendingPathComponent("generation.json"))
         let reference = try Reference(generation: id, revision: payload.manifest.revision, sequence: payload.manifest.sequence,
                                       manifestSHA256: payload.manifest.identity, descriptorSHA256: PublicCatalogUpdateIntegrity.digest(descriptorBytes))
-        // Verify persisted bytes and semantic joins before the single activation write.
-        let installed = try readGeneration(reference, fullPack: true, recovered: false)
-        guard let pack = installed.pack else { throw CoreError("The public catalog generation could not be loaded.") }
+        // Verify every persisted file's SHA-256 on disk via streaming digest without re-decoding 200+ MB JSON into RAM.
+        // payload.pack was already validated from the exact byte-identical payload.files verified on disk.
+        let installed = try readGeneration(reference, fullPack: false, recovered: false)
+        let pack = payload.pack
         var revisions = oldState?.revisions ?? [:]
         revisions[payload.manifest.revision] = RevisionRecord(sequence: payload.manifest.sequence, manifestSHA256: reference.manifestSHA256)
         let state = State(schemaVersion: 1, active: reference, previous: previous?.reference,
@@ -232,11 +241,13 @@ public struct PublicCatalogUpdateStore: Sendable {
               index.addresses == rawCatalog.communities.flatMap(\.matchingAddresses) else { throw CoreError("The public address snapshot does not match its catalog.") }
         var pack: LocalDataPack?
         if fullPack {
-            var files = ["public-catalog.json": catalogData]
-            for name in PublicCatalogUpdateManifest.fileNames where name != "public-catalog.json" {
-                files[name] = try DataPackPayload.boundedData(generation.appendingPathComponent(name), maximum: PublicCatalogUpdateManifest.limits[name]!)
+            pack = try withAutoreleasePool {
+                var files = ["public-catalog.json": catalogData]
+                for name in PublicCatalogUpdateManifest.fileNames where name != "public-catalog.json" {
+                    files[name] = try DataPackPayload.mappedBoundedData(generation.appendingPathComponent(name), maximum: PublicCatalogUpdateManifest.limits[name]!)
+                }
+                return try PublicCatalogUpdatePayload(manifestData: manifestData, files: files).pack
             }
-            pack = try PublicCatalogUpdatePayload(manifestData: manifestData, files: files).pack
         }
         return Resolved(reference: reference, manifest: manifest, index: index, pack: pack, recovered: recovered)
     }
