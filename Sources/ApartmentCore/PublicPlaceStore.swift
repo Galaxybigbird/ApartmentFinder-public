@@ -292,7 +292,7 @@ public final class PublicPlaceStore: @unchecked Sendable {
             self.tempURL = destinationURL.deletingLastPathComponent()
                 .appendingPathComponent(".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp")
             var handle: OpaquePointer?
-            let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX
             guard sqlite3_open_v2(tempURL.path, &handle, flags, nil) == SQLITE_OK, let handle else {
                 if let handle { sqlite3_close_v2(handle) }
                 try? FileManager.default.removeItem(at: tempURL)
@@ -302,8 +302,8 @@ public final class PublicPlaceStore: @unchecked Sendable {
             let ddl = """
             PRAGMA journal_mode = OFF;
             PRAGMA synchronous = OFF;
-            PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -4000;
+            PRAGMA temp_store = FILE;
+            PRAGMA cache_size = -2000;
             CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
             CREATE TABLE places (
                 id TEXT PRIMARY KEY NOT NULL,

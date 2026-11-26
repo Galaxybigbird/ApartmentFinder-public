@@ -428,10 +428,16 @@ final class PublicCatalogUpdateTests: XCTestCase {
         XCTAssertFalse(reopened.needsBackgroundIndex)
         let sel = try XCTUnwrap(reopened.selection)
 
-        for cid in ["rome-park-villas", "latigo", "lyric", "the-myles", "sportsmans-manor"] {
+        for cid in ["rome-park-villas", "latigo", "lyric"] {
             let pins = sel.placeStore.places(in: cid)
             print("  query \(cid): \(pins.count) pins (sample unit=\(pins.first?.unit ?? "-"))")
             XCTAssertFalse(pins.isEmpty, "Missing pins for \(cid)")
+        }
+        for namePart in ["Myles", "Sportsman"] {
+            let comm = try XCTUnwrap(sel.catalog.communities.first(where: { $0.name.localizedCaseInsensitiveContains(namePart) }), "Missing community matching \(namePart)")
+            let pins = sel.placeStore.places(in: comm.id)
+            print("  query \(comm.id) (\(comm.name)): \(pins.count) pins")
+            XCTAssertGreaterThan(pins.count, 100)
         }
 
         let resolver = DeliveryAddress.Resolver(knownAddresses: sel.catalog.communities.flatMap(\.matchingAddresses))
@@ -442,7 +448,7 @@ final class PublicCatalogUpdateTests: XCTestCase {
         let fpEnd = jetsamFootprintMB()
         print(String(format: "ALL LIVE WAVE 36 CHECKS PASSED in %.2fs | final phys_footprint=%.1f MB peak=%.1f MB",
                      Date().timeIntervalSince(t0), fpEnd.current, fpEnd.peak))
-        XCTAssertLessThan(fpEnd.peak, 250.0, "Peak Jetsam physical footprint must remain well below iOS OOM threshold")
+        XCTAssertLessThan(fpEnd.peak, 150.0, "Peak Jetsam physical footprint must stay under 150 MB")
     }
 }
 

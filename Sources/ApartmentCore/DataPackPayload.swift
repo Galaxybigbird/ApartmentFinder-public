@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A validated snapshot of the existing three-file format. It contains no personal backup.
 public struct DataPackPayload: Sendable {
@@ -55,6 +60,34 @@ public struct DataPackPayload: Sendable {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let size = values.fileSize, size <= maximum else { throw CoreError("A map-pack file is missing, unsupported or too large.") }
+        #if canImport(Darwin) || canImport(Glibc)
+        // Use POSIX read() into one reusable 64 KB buffer so hashing 200+ MB never leaks
+        // thousands of autoreleased NSData objects from NSFileHandle.read(upToCount:).
+        let fd = url.withUnsafeFileSystemRepresentation { ptr -> Int32 in
+            guard let ptr else { return -1 }
+            return open(ptr, O_RDONLY)
+        }
+        guard fd >= 0 else { throw CoreError("A map-pack file could not be opened.") }
+        defer { close(fd) }
+        let chunkSize = 65_536
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { buffer.deallocate() }
+        var count = 0
+        while true {
+            let remaining = maximum + 1 - count
+            let toRead = min(chunkSize, remaining)
+            let n = read(fd, buffer, toRead)
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw CoreError("A map-pack file could not be read.")
+            }
+            if n == 0 { break }
+            count += n
+            guard count <= maximum else { throw CoreError("A map-pack file is too large.") }
+            try consume(Data(bytesNoCopy: buffer, count: n, deallocator: .none))
+        }
+        return count
+        #else
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var count = 0
@@ -64,6 +97,7 @@ public struct DataPackPayload: Sendable {
             try consume(chunk)
         }
         return count
+        #endif
     }
     var files: [String: Data] { ["catalog.json": catalog, "locations.geojson": locations, "paths.geojson": paths] }
 }

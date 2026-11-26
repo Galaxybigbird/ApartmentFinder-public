@@ -1,9 +1,14 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// Zero-DOM streaming scanner for GeoJSON FeatureCollection payloads.
-/// Reads 64 KB chunks from disk (or an in-memory Data slice) and yields one
-/// raw JSON feature object at a time so Foundation's JSONDecoder never builds
-/// a multi-hundred-megabyte JSONMap over 200+ MB GeoJSON files on iOS.
+/// Uses POSIX read() into a single reusable 64 KB buffer (zero ObjC NSFileHandle autorelease
+/// overhead) and yields one raw JSON feature object at a time so peak memory stays < 1 MB
+/// across 230+ MB GeoJSON files on iOS.
 enum StreamingGeoJSON {
     struct Header: Sendable {
         let type: String
@@ -18,15 +23,26 @@ enum StreamingGeoJSON {
 
     @discardableResult
     static func scan(fileURL: URL, onFeature: (Data) throws -> Void) throws -> Header {
+        #if canImport(Darwin) || canImport(Glibc)
+        let fd = fileURL.withUnsafeFileSystemRepresentation { ptr -> Int32 in
+            guard let ptr else { return -1 }
+            return open(ptr, O_RDONLY)
+        }
+        guard fd >= 0 else { throw CoreError("Could not open GeoJSON feature collection.") }
+        defer { close(fd) }
+        var reader = ByteReader(fd: fd)
+        return try scanCollection(&reader, onFeature: onFeature)
+        #else
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
-        var reader = ByteReader(source: .file(handle))
+        var reader = ByteReader(handle: handle)
         return try scanCollection(&reader, onFeature: onFeature)
+        #endif
     }
 
     @discardableResult
     static func scan(data: Data, onFeature: (Data) throws -> Void) throws -> Header {
-        var reader = ByteReader(source: .data(data, offset: 0))
+        var reader = ByteReader(data: data)
         return try scanCollection(&reader, onFeature: onFeature)
     }
 
@@ -79,8 +95,9 @@ enum StreamingGeoJSON {
                         try reader.skipWhitespace()
                         featureBuffer.removeAll(keepingCapacity: true)
                         try reader.readJSONObject(into: &featureBuffer, maxBytes: maxFeatureBytes)
-                        try withAutoreleasePool {
-                            try onFeature(Data(featureBuffer))
+                        try featureBuffer.withUnsafeMutableBufferPointer { buf in
+                            let slice = Data(bytesNoCopy: buf.baseAddress!, count: buf.count, deallocator: .none)
+                            try withAutoreleasePool { try onFeature(slice) }
                         }
                         featureCount += 1
                         try reader.skipWhitespace()
@@ -125,58 +142,95 @@ enum StreamingGeoJSON {
     }
 
     private struct ByteReader {
-        enum Source {
+        private enum Source {
+            #if canImport(Darwin) || canImport(Glibc)
+            case fd(Int32)
+            #else
             case file(FileHandle)
+            #endif
             case data(Data, offset: Int)
         }
 
         private var source: Source
-        private var chunk: [UInt8] = []
+        private var chunk: [UInt8]
+        private var validCount = 0
         private var index = 0
         private var eof = false
 
-        init(source: Source) {
-            self.source = source
+        #if canImport(Darwin) || canImport(Glibc)
+        init(fd: Int32) {
+            self.source = .fd(fd)
+            self.chunk = [UInt8](repeating: 0, count: StreamingGeoJSON.chunkSize)
+        }
+        #else
+        init(handle: FileHandle) {
+            self.source = .file(handle)
+            self.chunk = []
+        }
+        #endif
+
+        init(data: Data) {
+            self.source = .data(data, offset: 0)
+            self.chunk = [UInt8](repeating: 0, count: min(data.count, StreamingGeoJSON.chunkSize))
         }
 
         private mutating func refill() throws {
             if eof { return }
             switch source {
+            #if canImport(Darwin) || canImport(Glibc)
+            case .fd(let fd):
+                while true {
+                    let n = chunk.withUnsafeMutableBytes { buf in
+                        read(fd, buf.baseAddress!, StreamingGeoJSON.chunkSize)
+                    }
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        throw CoreError("Could not read GeoJSON feature collection.")
+                    }
+                    if n == 0 {
+                        validCount = 0
+                        index = 0
+                        eof = true
+                        return
+                    }
+                    validCount = n
+                    index = 0
+                    return
+                }
+            #else
             case .file(let handle):
                 guard let next = try handle.read(upToCount: StreamingGeoJSON.chunkSize), !next.isEmpty else {
-                    chunk.removeAll(keepingCapacity: false)
-                    index = 0
-                    eof = true
-                    return
+                    validCount = 0; index = 0; eof = true; return
                 }
-                chunk = Array(next)
-                index = 0
+                chunk = Array(next); validCount = chunk.count; index = 0
+            #endif
             case .data(let data, let offset):
                 guard offset < data.count else {
-                    chunk.removeAll(keepingCapacity: false)
-                    index = 0
-                    eof = true
-                    return
+                    validCount = 0; index = 0; eof = true; return
                 }
-                let end = min(data.count, offset + StreamingGeoJSON.chunkSize)
-                chunk = Array(data[offset..<end])
+                let count = min(data.count - offset, StreamingGeoJSON.chunkSize)
+                if chunk.count < count { chunk = [UInt8](repeating: 0, count: count) }
+                chunk.withUnsafeMutableBytes { dst in
+                    data.copyBytes(to: dst.bindMemory(to: UInt8.self).baseAddress!, from: offset..<(offset + count))
+                }
+                validCount = count
                 index = 0
-                source = .data(data, offset: end)
+                source = .data(data, offset: offset + count)
             }
         }
 
         mutating func peekByte() throws -> UInt8? {
-            if index >= chunk.count {
+            if index >= validCount {
                 try refill()
-                if index >= chunk.count { return nil }
+                if index >= validCount { return nil }
             }
             return chunk[index]
         }
 
         mutating func readByte() throws -> UInt8? {
-            if index >= chunk.count {
+            if index >= validCount {
                 try refill()
-                if index >= chunk.count { return nil }
+                if index >= validCount { return nil }
             }
             let b = chunk[index]
             index += 1
@@ -240,14 +294,14 @@ enum StreamingGeoJSON {
             var escaped = false
 
             while depth > 0 {
-                if index >= chunk.count {
+                if index >= validCount {
                     try refill()
-                    guard index < chunk.count else {
+                    guard index < validCount else {
                         throw CoreError("Truncated GeoJSON feature object.")
                     }
                 }
                 let start = index
-                while index < chunk.count && depth > 0 {
+                while index < validCount && depth > 0 {
                     let b = chunk[index]
                     index += 1
                     if inString {

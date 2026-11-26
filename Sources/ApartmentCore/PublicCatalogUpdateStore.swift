@@ -379,11 +379,10 @@ public struct PublicCatalogUpdateStore: Sendable {
 
         let header = try StreamingGeoJSON.scan(fileURL: locationsURL) { featureData in
             if featureCount & 0x3FF == 0 { try Task.checkCancellation() }
-            let admittedID = try PublicCatalogUpdateAdmission.validatePointFeatureData(featureData, decoder: decoder)
-            guard !pathIDs.contains(admittedID) else {
+            let place = try PublicCatalogUpdateAdmission.validateAndDecodePointFeature(featureData, decoder: decoder)
+            guard !pathIDs.contains(place.id) else {
                 throw CoreError("Duplicate public feature identity.")
             }
-            let place = try LocalDataPack.decodePointFeature(featureData, decoder: decoder)
             try LocalDataPack.validatePlace(place, metadata: metadata)
             let street = keyCache[place.address] ?? {
                 let computed = LocalSearch.addressKey(place.address)

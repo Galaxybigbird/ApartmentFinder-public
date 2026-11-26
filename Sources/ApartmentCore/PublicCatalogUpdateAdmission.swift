@@ -63,6 +63,11 @@ enum PublicCatalogUpdateAdmission {
         try decoder.decode(ValidatedPointFeature.self, from: data).id
     }
 
+    /// Single-pass admission validation + Place decode (halves JSONDecoder overhead on 355k+ features).
+    static func validateAndDecodePointFeature(_ data: Data, decoder: JSONDecoder = JSONDecoder()) throws -> Place {
+        try decoder.decode(AdmittedPointFeature.self, from: data).place
+    }
+
     static func validatePathFeatureData(_ data: Data, decoder: JSONDecoder = JSONDecoder()) throws -> String {
         try decoder.decode(ValidatedPathFeature.self, from: data).id
     }
@@ -167,6 +172,111 @@ enum PublicCatalogUpdateAdmission {
                 }
             }
             self.id = id
+        }
+    }
+
+    private struct AdmittedPointFeature: Decodable {
+        let place: Place
+        private static let typeKey = DynamicKey("type")
+        private static let idKey = DynamicKey("id")
+        private static let geometryKey = DynamicKey("geometry")
+        private static let coordinatesKey = DynamicKey("coordinates")
+        private static let propertiesKey = DynamicKey("properties")
+        private static let communityIDKey = DynamicKey("communityID")
+        private static let addressKey = DynamicKey("address")
+        private static let buildingKey = DynamicKey("building")
+        private static let unitKey = DynamicKey("unit")
+        private static let floorKey = DynamicKey("floor")
+        private static let kindKey = DynamicKey("kind")
+        private static let verificationKey = DynamicKey("verification")
+        private static let sourceIDsKey = DynamicKey("sourceIDs")
+        private static let notesKey = DynamicKey("notes")
+        private static let identityUncertainKey = DynamicKey("identityUncertain")
+        private static let referenceKindKey = DynamicKey("referenceKind")
+        private static let estimatedHorizontalUncertaintyMKey = DynamicKey("estimatedHorizontalUncertaintyM")
+        private static let mapLabelOccurrenceIDKey = DynamicKey("mapLabelOccurrenceID")
+        private static let sourceUnitIDKey = DynamicKey("sourceUnitID")
+        private static let referenceAddressesKey = DynamicKey("referenceAddresses")
+        private static let estimateKey = DynamicKey("entranceSideEstimate")
+        private static let frontageKey = DynamicKey("frontage")
+        private static let estimateFlags = [
+            DynamicKey("uncertaintyCalibrated"), DynamicKey("doorCoordinatesVerified"),
+            DynamicKey("entranceCoordinatesVerified"), DynamicKey("physicalSignageVerified")
+        ]
+
+        init(from decoder: Decoder) throws {
+            let feature = try decoder.container(keyedBy: DynamicKey.self)
+            try PublicCatalogUpdateAdmission.checkKeys(feature, allowed: PublicCatalogUpdateAdmission.featureAllowed,
+                                                       required: PublicCatalogUpdateAdmission.featureRequired)
+            let featureType = try feature.decode(String.self, forKey: Self.typeKey)
+            guard let id = try? feature.decode(String.self, forKey: Self.idKey) else {
+                throw CoreError("Duplicate public feature identity.")
+            }
+            let geometry = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.geometryKey)
+            try PublicCatalogUpdateAdmission.checkKeys(geometry, allowed: PublicCatalogUpdateAdmission.geometryAllowed,
+                                                       required: PublicCatalogUpdateAdmission.geometryRequired)
+            let geomType = try geometry.decode(String.self, forKey: Self.typeKey)
+            guard featureType == "Feature", geomType == "Point", !id.isEmpty else {
+                throw CoreError("Invalid point feature.")
+            }
+            let coords = try geometry.decode([Double].self, forKey: Self.coordinatesKey)
+            guard coords.count == 2 else { throw CoreError("Expected a longitude/latitude pair.") }
+            let coordinate = Coordinate(latitude: coords[1], longitude: coords[0])
+            guard coordinate.isValid else { throw CoreError("Invalid map coordinates.") }
+
+            let properties = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.propertiesKey)
+            try PublicCatalogUpdateAdmission.checkKeys(properties, allowed: PublicCatalogUpdateAdmission.pointKeys,
+                                                       required: PublicCatalogUpdateAdmission.pointRequired)
+            guard let kindRaw = try? properties.decode(String.self, forKey: Self.kindKey),
+                  (kindRaw == "building" || kindRaw == "unitPosition"),
+                  let kind = LocationKind(rawValue: kindRaw),
+                  let verRaw = try? properties.decode(String.self, forKey: Self.verificationKey),
+                  (verRaw == "sourceMapped" || verRaw == "estimated"),
+                  let verification = Verification(rawValue: verRaw) else {
+                throw CoreError("A public update cannot assert a checked door or entrance.")
+            }
+
+            var entranceSideEstimate: EntranceSideEstimate?
+            if properties.contains(Self.estimateKey), !(try properties.decodeNil(forKey: Self.estimateKey)) {
+                let estimate = try properties.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.estimateKey)
+                try PublicCatalogUpdateAdmission.checkKeys(estimate, allowed: PublicCatalogUpdateAdmission.estimateAllowed,
+                                                           required: PublicCatalogUpdateAdmission.estimateRequiredList)
+                for flag in Self.estimateFlags {
+                    guard (try? estimate.decode(Bool.self, forKey: flag)) == false else {
+                        throw CoreError("Public entrance estimates must remain explicitly unverified.")
+                    }
+                }
+                var frontage = try estimate.nestedUnkeyedContainer(forKey: Self.frontageKey)
+                while !frontage.isAtEnd {
+                    let coord = try frontage.nestedContainer(keyedBy: DynamicKey.self)
+                    try PublicCatalogUpdateAdmission.checkKeys(coord, allowed: PublicCatalogUpdateAdmission.coordinateAllowed,
+                                                               required: PublicCatalogUpdateAdmission.coordinateRequired)
+                }
+                entranceSideEstimate = try properties.decode(EntranceSideEstimate.self, forKey: Self.estimateKey)
+            }
+
+            place = Place(
+                id: id,
+                communityID: try properties.decode(String.self, forKey: Self.communityIDKey),
+                address: try properties.decode(String.self, forKey: Self.addressKey),
+                building: try properties.decode(String.self, forKey: Self.buildingKey),
+                unit: try properties.decode(String.self, forKey: Self.unitKey),
+                floor: try properties.decode(String.self, forKey: Self.floorKey),
+                kind: kind,
+                verification: verification,
+                coordinate: coordinate,
+                sourceIDs: try properties.decode([String].self, forKey: Self.sourceIDsKey),
+                notes: try properties.decode(String.self, forKey: Self.notesKey),
+                approachID: nil,
+                graphNodeID: nil,
+                identityUncertain: try properties.decodeIfPresent(Bool.self, forKey: Self.identityUncertainKey),
+                referenceKind: try properties.decodeIfPresent(BuildingReferenceKind.self, forKey: Self.referenceKindKey),
+                estimatedHorizontalUncertaintyM: try properties.decodeIfPresent(Double.self, forKey: Self.estimatedHorizontalUncertaintyMKey),
+                mapLabelOccurrenceID: try properties.decodeIfPresent(String.self, forKey: Self.mapLabelOccurrenceIDKey),
+                sourceUnitID: try properties.decodeIfPresent(String.self, forKey: Self.sourceUnitIDKey),
+                referenceAddresses: try properties.decodeIfPresent([String].self, forKey: Self.referenceAddressesKey),
+                entranceSideEstimate: entranceSideEstimate
+            )
         }
     }
 

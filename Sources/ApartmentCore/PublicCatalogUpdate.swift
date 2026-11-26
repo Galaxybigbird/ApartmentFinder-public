@@ -1,5 +1,10 @@
 import Foundation
 import CoreFoundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -224,18 +229,21 @@ enum PublicCatalogGzip {
         guard expectedBytes >= 1, expectedBytes <= maximumBytes, compressed.count >= 18 else {
             throw CoreError("Invalid gzip public catalog payload.")
         }
-        #if canImport(Compression) && canImport(CryptoKit)
-        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        #if canImport(Compression) && canImport(CryptoKit) && canImport(Darwin)
+        var succeeded = false
+        defer { if !succeeded { try? FileManager.default.removeItem(at: outputURL) } }
+        let fd = outputURL.withUnsafeFileSystemRepresentation { ptr -> Int32 in
+            guard let ptr else { return -1 }
+            return open(ptr, O_WRONLY | O_CREAT | O_TRUNC, mode_t(0o644))
+        }
+        guard fd >= 0 else { throw CoreError("Unable to create decompressed public catalog file.") }
+        defer { close(fd) }
         #if os(iOS)
         try? FileManager.default.setAttributes(
             [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
             ofItemAtPath: outputURL.path
         )
         #endif
-        var succeeded = false
-        defer { if !succeeded { try? FileManager.default.removeItem(at: outputURL) } }
-        let handle = try FileHandle(forWritingTo: outputURL)
-        defer { try? handle.close() }
 
         var totalWritten = 0
         var runningCRC: UInt32 = 0xFFFF_FFFF
@@ -279,7 +287,15 @@ enum PublicCatalogGzip {
                     }
                     runningCRC = updateCRC32(runningCRC, bytes: dstBuf, count: produced)
                     hasher.update(bufferPointer: UnsafeRawBufferPointer(start: dstBuf, count: produced))
-                    try handle.write(contentsOf: Data(bytesNoCopy: dstBuf, count: produced, deallocator: .none))
+                    var writtenOffset = 0
+                    while writtenOffset < produced {
+                        let w = Darwin.write(fd, dstBuf.advanced(by: writtenOffset), produced - writtenOffset)
+                        if w < 0 {
+                            if errno == EINTR { continue }
+                            throw CoreError("Unable to write decompressed public catalog.")
+                        }
+                        writtenOffset += w
+                    }
                     totalWritten += produced
                 }
                 if status == COMPRESSION_STATUS_END {
@@ -299,7 +315,7 @@ enum PublicCatalogGzip {
         guard (runningCRC ^ 0xFFFF_FFFF) == expectedCRC else {
             throw CoreError("Decompressed public catalog CRC32 mismatch.")
         }
-        try handle.synchronize()
+        _ = fsync(fd)
         succeeded = true
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return (totalWritten, digest)
