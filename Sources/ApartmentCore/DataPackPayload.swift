@@ -65,10 +65,20 @@ public struct DataPackPayload: Sendable {
         // thousands of autoreleased NSData objects from NSFileHandle.read(upToCount:).
         let fd = url.withUnsafeFileSystemRepresentation { ptr -> Int32 in
             guard let ptr else { return -1 }
-            return open(ptr, O_RDONLY)
+            #if canImport(Darwin)
+            return Darwin.open(ptr, O_RDONLY)
+            #else
+            return Glibc.open(ptr, O_RDONLY)
+            #endif
         }
         guard fd >= 0 else { throw CoreError("A map-pack file could not be opened.") }
-        defer { close(fd) }
+        defer {
+            #if canImport(Darwin)
+            Darwin.close(fd)
+            #else
+            Glibc.close(fd)
+            #endif
+        }
         let chunkSize = 65_536
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
         defer { buffer.deallocate() }
@@ -76,7 +86,11 @@ public struct DataPackPayload: Sendable {
         while true {
             let remaining = maximum + 1 - count
             let toRead = min(chunkSize, remaining)
-            let n = read(fd, buffer, toRead)
+            #if canImport(Darwin)
+            let n = Darwin.read(fd, buffer, toRead)
+            #else
+            let n = Glibc.read(fd, buffer, toRead)
+            #endif
             if n < 0 {
                 if errno == EINTR { continue }
                 throw CoreError("A map-pack file could not be read.")
