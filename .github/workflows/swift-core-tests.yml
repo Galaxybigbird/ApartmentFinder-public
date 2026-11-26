@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          swift build -c release --build-tests --disable-automatic-resolution --skip-update
+          swift build -c release -Xswiftc -enable-testing --build-tests --disable-automatic-resolution --skip-update
           RUN_LIVE_WAVE36_BENCH=1 /usr/bin/time -l swift test -c release --skip-build --filter testLiveWave36StreamingInstallAndPeakRSS 2>&1 | tee "$RUNNER_TEMP/bench.log"
           PEAK_BYTES=$(awk '/maximum resident set size/ {print $1}' "$RUNNER_TEMP/bench.log" | tail -n 1)
           PEAK_MB=$(python3 -c "print(round($PEAK_BYTES / 1048576.0, 2))")
