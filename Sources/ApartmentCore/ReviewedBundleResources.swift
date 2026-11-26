@@ -2,6 +2,16 @@ import Foundation
 
 /// Immutable public numerical resources; never install or rewrite user data.
 public enum ReviewedBundleResources {
+    /// Lightweight manifest-only read (451 bytes) so launch skips parsing 36 MB baseline GeoJSON
+    /// whenever a newer installed public catalog is already present.
+    public static func baselineManifest(from bundle: Bundle) throws -> PublicCatalogUpdateManifest? {
+        let names = [("reviewed-baseline-manifest", "json", 16_384, "002a4c672e623f56a898806dfe91fe4754a271389ba8ff4585098a81521c3f73")]
+        guard let bytes = try read(names, from: bundle) else { return nil }
+        let manifest = try PublicCatalogUpdateManifest.read(bytes[0])
+        guard manifest.revision == "2026.10.27.2", manifest.sequence == 93 else { throw CoreError("Unexpected reviewed baseline revision.") }
+        return manifest
+    }
+
     public static func baseline(from bundle: Bundle) throws -> PublicCatalogUpdatePayload? {
         let names = [("reviewed-baseline-manifest", "json", 16_384, "002a4c672e623f56a898806dfe91fe4754a271389ba8ff4585098a81521c3f73"),
                      ("reviewed-baseline-catalog", "json", 3_000_000, "c959e033b5a3ea49d48b8a218ca5ee6ac85350bf41b0505a68bc90fbff823e63"),

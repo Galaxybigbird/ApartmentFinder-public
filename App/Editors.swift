@@ -65,7 +65,7 @@ struct PinEditor: View {
                     Text("Selecting an endpoint moves this pin to that exact junction. Confirm that the endpoint reaches this location.").font(.caption)
                     Picker("Vehicle approach",selection: Binding(get: { place.approachID ?? "" },set: { place.approachID = $0.isEmpty ? nil : $0 })) {
                         Text("No vehicle approach").tag("")
-                        ForEach(store.places.filter { $0.communityID == place.communityID && $0.kind == .entrance && $0.verification == .fieldVerified }) {
+                        ForEach(store.places(in: place.communityID).filter { $0.kind == .entrance && $0.verification == .fieldVerified }) {
                             Text($0.notes.isEmpty ? "Entrance \($0.id.prefix(8))" : $0.notes).tag($0.id)
                         }
                     }

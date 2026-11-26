@@ -37,6 +37,14 @@ public struct PublicCatalogUpdateStore: Sendable {
         let pack: LocalDataPack?
         let recovered: Bool
     }
+    private struct ResolvedIndexed {
+        let reference: Reference
+        let manifest: PublicCatalogUpdateManifest
+        let catalog: Catalog
+        let paths: [PathSegment]
+        let placeStore: PublicPlaceStore
+        let recovered: Bool
+    }
     private var stateURL: URL { directory.appendingPathComponent("selection.json") }
     private var generationsURL: URL { directory.appendingPathComponent("generations", isDirectory: true) }
 
@@ -45,6 +53,16 @@ public struct PublicCatalogUpdateStore: Sendable {
         return PublicCatalogUpdateSelection(pack: pack, manifest: value.manifest, recoveredPrevious: value.recovered,
                                             canRollback: canRollback(state, selected: value.reference))
     }
+
+    public func loadIndexed() throws -> IndexedPublicCatalogSelection? {
+        guard let (state, value) = try resolveIndexed(buildLargeIndexInline: true) else { return nil }
+        return IndexedPublicCatalogSelection(
+            catalog: value.catalog, paths: value.paths, placeStore: value.placeStore,
+            manifest: value.manifest, recoveredPrevious: value.recovered,
+            canRollback: canRollback(state, selected: value.reference)
+        )
+    }
+
     /// One coherent selection and conservative bundle eligibility; this never changes the store.
     public func reviewedBundleSelection() throws -> (selection: PublicCatalogUpdateSelection?, bundleAllowed: Bool) {
         Self.writer.lock(); defer { Self.writer.unlock() }
@@ -59,6 +77,33 @@ public struct PublicCatalogUpdateStore: Sendable {
         return (selection, state.rejectedRevisions.isEmpty && !value.recovered &&
             state.highestSequence == value.reference.sequence)
     }
+
+    /// Zero-OOM SQLite-indexed counterpart to reviewedBundleSelection().
+    /// When `buildLargeIndexInline` is false and an older >10 MB generation has not yet built
+    /// `places.sqlite`, returns `needsBackgroundIndex: true` immediately so launch never blocks.
+    public func reviewedBundleIndexedSelection(buildLargeIndexInline: Bool = true) throws -> (selection: IndexedPublicCatalogSelection?, bundleAllowed: Bool, needsBackgroundIndex: Bool) {
+        Self.writer.lock(); defer { Self.writer.unlock() }
+        guard let state = try readState() else {
+            guard FileManager.default.fileExists(atPath: directory.path) else { return (nil, true, false) }
+            try DataPackPayload.checkDirectory(directory)
+            return (nil, try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty, false)
+        }
+        if !buildLargeIndexInline, needsIndexBuild(for: state.active) {
+            return (nil, false, true)
+        }
+        guard let (resolvedState, value) = try resolveIndexed(buildLargeIndexInline: buildLargeIndexInline) else {
+            return (nil, false, false)
+        }
+        let selection = IndexedPublicCatalogSelection(
+            catalog: value.catalog, paths: value.paths, placeStore: value.placeStore,
+            manifest: value.manifest, recoveredPrevious: value.recovered,
+            canRollback: canRollback(resolvedState, selected: value.reference)
+        )
+        let allowed = resolvedState.rejectedRevisions.isEmpty && !value.recovered &&
+            resolvedState.highestSequence == value.reference.sequence
+        return (selection, allowed, false)
+    }
+
     /// Lightweight metadata-only eligibility check (verifies generation digests without reloading 200+ MB GeoJSON).
     public func isReviewedBundleAllowed(for manifest: PublicCatalogUpdateManifest) -> Bool {
         Self.writer.lock(); defer { Self.writer.unlock() }
@@ -104,6 +149,21 @@ public struct PublicCatalogUpdateStore: Sendable {
             try Task.checkCancellation()
             try write(payload.files[name]!, to: generation.appendingPathComponent(name))
         }
+        // Prebuild SQLite index for fast zero-OOM reads.
+        if let locDesc = payload.manifest.files["public-locations.geojson"] {
+            let dbURL = generation.appendingPathComponent("places.sqlite")
+            let writer = try PublicPlaceStore.Writer(destinationURL: dbURL, locationsSHA256: locDesc.sha256, packVersion: payload.pack.catalog.packVersion)
+            var keyCache: [String: String] = [:]
+            for place in payload.pack.places {
+                let key = keyCache[place.address] ?? {
+                    let computed = LocalSearch.addressKey(place.address)
+                    keyCache[place.address] = computed
+                    return computed
+                }()
+                try writer.insert(place, addressKey: key)
+            }
+            _ = try writer.finish()
+        }
         try write(payload.manifestData, to: generation.appendingPathComponent("manifest.json"))
         try write(indexBytes, to: generation.appendingPathComponent("known-addresses.json"))
         let descriptor = Descriptor(schemaVersion: 1, generation: id,
@@ -112,8 +172,6 @@ public struct PublicCatalogUpdateStore: Sendable {
         try write(descriptorBytes, to: generation.appendingPathComponent("generation.json"))
         let reference = try Reference(generation: id, revision: payload.manifest.revision, sequence: payload.manifest.sequence,
                                       manifestSHA256: payload.manifest.identity, descriptorSHA256: PublicCatalogUpdateIntegrity.digest(descriptorBytes))
-        // Verify every persisted file's SHA-256 on disk via streaming digest without re-decoding 200+ MB JSON into RAM.
-        // payload.pack was already validated from the exact byte-identical payload.files verified on disk.
         let installed = try readGeneration(reference, fullPack: false, recovered: false)
         let pack = payload.pack
         var revisions = oldState?.revisions ?? [:]
@@ -124,9 +182,83 @@ public struct PublicCatalogUpdateStore: Sendable {
         try beforeActivation(); try Task.checkCancellation()
         try write(PublicCatalogUpdateJSON.encode(state), to: stateURL)
         committed = true
-        // A late cancellation must not report failure after a successful atomic activation.
         prune(state)
         return PublicCatalogUpdateSelection(pack: pack, manifest: installed.manifest, recoveredPrevious: false, canRollback: previous != nil)
+    }
+
+    /// Streams download, gzip decompression, admission validation, and SQLite indexing directly
+    /// to a staged generation directory without ever holding 200+ MB JSON or 355k Place structs in RAM.
+    @discardableResult
+    public func installStreaming(manifestData: Data, client: PublicCatalogUpdateClient,
+                                 beforeActivation: @Sendable () throws -> Void = {}) async throws -> IndexedPublicCatalogSelection? {
+        try Task.checkCancellation()
+        let manifest = try PublicCatalogUpdateManifest.read(manifestData)
+        let needsInstall: Bool = try withWriterLock {
+            try admission(manifest, state: try readState())
+        }
+        guard needsInstall else { return nil }
+
+        try withWriterLock {
+            try createDirectory(directory)
+            try createDirectory(generationsURL)
+        }
+        let id = UUID().uuidString
+        let generation = generationsURL.appendingPathComponent(id, isDirectory: true)
+        try withWriterLock {
+            guard !FileManager.default.fileExists(atPath: generation.path) else {
+                throw CoreError("A public catalog generation already exists.")
+            }
+            try createDirectory(generation)
+            try write(Data(id.utf8), to: generation.appendingPathComponent("public-generation-owner"))
+        }
+        var committed = false
+        defer {
+            if !committed {
+                withWriterLock { removeOwnedGeneration(id) }
+            }
+        }
+
+        // 1. Stream each payload file directly to disk with manifest byte-length + SHA-256 verification.
+        for name in PublicCatalogUpdateManifest.fileNames {
+            try Task.checkCancellation()
+            try await client.fetchFile(named: name, manifest: manifest, to: generation.appendingPathComponent(name))
+        }
+        try Task.checkCancellation()
+
+        // 2. Validate catalog, paths, and stream-validate + index locations into places.sqlite (< 30 MB peak RAM).
+        let (catalog, segments, placeStore, indexBytes) = try validateAndIndexGeneration(generation, manifest: manifest)
+        try Task.checkCancellation()
+
+        try write(manifestData, to: generation.appendingPathComponent("manifest.json"))
+        try write(indexBytes, to: generation.appendingPathComponent("known-addresses.json"))
+        let descriptor = Descriptor(schemaVersion: 1, generation: id,
+                                    manifest: try record(manifestData), addressIndex: try record(indexBytes))
+        let descriptorBytes = try PublicCatalogUpdateJSON.encode(descriptor)
+        try write(descriptorBytes, to: generation.appendingPathComponent("generation.json"))
+        let reference = try Reference(generation: id, revision: manifest.revision, sequence: manifest.sequence,
+                                      manifestSHA256: manifest.identity, descriptorSHA256: PublicCatalogUpdateIntegrity.digest(descriptorBytes))
+
+        // 3. Re-verify persisted files on disk and atomically activate under writer lock.
+        return try withWriterLock {
+            try Task.checkCancellation()
+            let oldState = try readState()
+            guard try admission(manifest, state: oldState) else { return nil }
+            let previous: Resolved? = oldState.flatMap { try? resolve($0, fullPack: false) }
+            let installed = try readGeneration(reference, fullPack: false, recovered: false)
+            var revisions = oldState?.revisions ?? [:]
+            revisions[manifest.revision] = RevisionRecord(sequence: manifest.sequence, manifestSHA256: reference.manifestSHA256)
+            let state = State(schemaVersion: 1, active: reference, previous: previous?.reference,
+                              highestSequence: max(oldState?.highestSequence ?? 0, manifest.sequence), revisions: revisions,
+                              rejectedRevisions: oldState?.rejectedRevisions ?? [])
+            try beforeActivation(); try Task.checkCancellation()
+            try write(PublicCatalogUpdateJSON.encode(state), to: stateURL)
+            committed = true
+            prune(state)
+            return IndexedPublicCatalogSelection(
+                catalog: catalog, paths: segments, placeStore: placeStore,
+                manifest: installed.manifest, recoveredPrevious: false, canRollback: previous != nil
+            )
+        }
     }
 
     @discardableResult public func rollback() throws -> PublicCatalogUpdateSelection {
@@ -140,7 +272,6 @@ public struct PublicCatalogUpdateStore: Sendable {
         guard let pack = candidate.pack else { throw CoreError("The previous public catalog could not be loaded.") }
         let rejected = state.active
         state.active = previous
-        // Keep rollback bytes for diagnosis only when intact; never select a rejected revision again.
         state.previous = (try? readGeneration(rejected, fullPack: false, recovered: false)) == nil ? nil : rejected
         if !state.rejectedRevisions.contains(rejected.revision) { state.rejectedRevisions.append(rejected.revision) }
         try Task.checkCancellation()
@@ -149,8 +280,133 @@ public struct PublicCatalogUpdateStore: Sendable {
         return PublicCatalogUpdateSelection(pack: pack, manifest: candidate.manifest, recoveredPrevious: false, canRollback: false)
     }
 
+    @discardableResult public func rollbackIndexed() throws -> IndexedPublicCatalogSelection {
+        Self.writer.lock(); defer { Self.writer.unlock() }
+        try Task.checkCancellation()
+        guard var state = try readState(), let previous = state.previous,
+              previous.generation != state.active.generation, !state.rejectedRevisions.contains(previous.revision) else {
+            throw CoreError("No verified previous public catalog is available.")
+        }
+        let candidate = try readGenerationIndexed(previous, recovered: false, buildLargeIndexInline: true)
+        let rejected = state.active
+        state.active = previous
+        state.previous = (try? readGeneration(rejected, fullPack: false, recovered: false)) == nil ? nil : rejected
+        if !state.rejectedRevisions.contains(rejected.revision) { state.rejectedRevisions.append(rejected.revision) }
+        try Task.checkCancellation()
+        try write(PublicCatalogUpdateJSON.encode(state), to: stateURL)
+        prune(state)
+        return IndexedPublicCatalogSelection(
+            catalog: candidate.catalog, paths: candidate.paths, placeStore: candidate.placeStore,
+            manifest: candidate.manifest, recoveredPrevious: false, canRollback: false
+        )
+    }
+
+    private func withWriterLock<T>(_ body: () throws -> T) rethrows -> T {
+        Self.writer.lock()
+        defer { Self.writer.unlock() }
+        return try body()
+    }
+
+    private func needsIndexBuild(for reference: Reference) -> Bool {
+        guard UUID(uuidString: reference.generation) != nil else { return false }
+        let generation = generationsURL.appendingPathComponent(reference.generation, isDirectory: true)
+        let dbURL = generation.appendingPathComponent("places.sqlite")
+        if FileManager.default.fileExists(atPath: dbURL.path) { return false }
+        let locURL = generation.appendingPathComponent("public-locations.geojson")
+        let size = (try? locURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return size > 10_000_000
+    }
+
+    private func validateAndIndexGeneration(_ generation: URL, manifest: PublicCatalogUpdateManifest) throws -> (Catalog, [PathSegment], PublicPlaceStore, Data) {
+        let catalogURL = generation.appendingPathComponent("public-catalog.json")
+        let pathsURL = generation.appendingPathComponent("public-paths.geojson")
+        let locationsURL = generation.appendingPathComponent("public-locations.geojson")
+        let dbURL = generation.appendingPathComponent("places.sqlite")
+
+        let catalogData = try DataPackPayload.boundedData(catalogURL, maximum: PublicCatalogUpdateManifest.limits["public-catalog.json"]!)
+        let pathsData = try DataPackPayload.boundedData(pathsURL, maximum: PublicCatalogUpdateManifest.limits["public-paths.geojson"]!)
+
+        try PublicCatalogUpdateAdmission.validateCatalog(catalogData)
+        let pathIDs = try PublicCatalogUpdateAdmission.validatePaths(pathsData)
+
+        let decoder = JSONDecoder()
+        var catalog = try decoder.decode(Catalog.self, from: catalogData)
+        guard catalog.packVersion == manifest.packVersion, !catalog.communities.isEmpty else {
+            throw CoreError("The public catalog payload has no matching usable catalog.")
+        }
+        guard catalog.communities.allSatisfy({ !LocalSearch.addressKey($0.address).isEmpty }) else {
+            throw CoreError("A public location does not match its complete property street identity.")
+        }
+        let metadata = try LocalDataPack.validateCatalogMetadata(catalog)
+        let segments = try LocalDataPack.readPaths(pathsData, catalog: catalog, metadata: metadata)
+        let indexBytes = try KnownAddressIndex(catalog: catalog).data()
+        _ = try KnownAddressIndex.read(indexBytes)
+
+        let locationsSHA256 = manifest.files["public-locations.geojson"]!.sha256
+
+        // Legacy Riley-separated pack versions (small <=40 MB packs) preserve exact in-memory separation.
+        if LocalDataPack.requiresRileySeparation(catalog) {
+            let locData = try DataPackPayload.mappedBoundedData(locationsURL, maximum: PublicCatalogUpdateManifest.limits["public-locations.geojson"]!)
+            try PublicCatalogUpdateAdmission.validate(["public-catalog.json": catalogData, "public-locations.geojson": locData, "public-paths.geojson": pathsData])
+            let pack = try LocalDataPack.read(catalog: catalogData, locations: locData, paths: pathsData)
+            guard !pack.places.isEmpty else { throw CoreError("The public catalog payload has no matching usable catalog.") }
+            catalog = pack.catalog
+            let postMetadata = try LocalDataPack.validateCatalogMetadata(catalog)
+            let writer = try PublicPlaceStore.Writer(destinationURL: dbURL, locationsSHA256: locationsSHA256, packVersion: catalog.packVersion)
+            var keyCache: [String: String] = [:]
+            for place in pack.places {
+                let street = keyCache[place.address] ?? {
+                    let computed = LocalSearch.addressKey(place.address)
+                    keyCache[place.address] = computed
+                    return computed
+                }()
+                guard !street.isEmpty, postMetadata.addressesByCommunity[place.communityID]?.contains(street) == true else {
+                    throw CoreError("A public location does not match its complete property street identity.")
+                }
+                try writer.insert(place, addressKey: street)
+            }
+            let store = try writer.finish()
+            return (catalog, pack.paths, store, indexBytes)
+        }
+
+        // Single-pass zero-DOM streaming admission + LocalDataPack validation + SQLite build.
+        let writer = try PublicPlaceStore.Writer(destinationURL: dbURL, locationsSHA256: locationsSHA256, packVersion: catalog.packVersion)
+        var placesByID: [String: Place] = [:]
+        if !metadata.neededRefIDs.isEmpty { placesByID.reserveCapacity(metadata.neededRefIDs.count) }
+        var keyCache: [String: String] = [:]
+        keyCache.reserveCapacity(4_096)
+        var featureCount = 0
+
+        let header = try StreamingGeoJSON.scan(fileURL: locationsURL) { featureData in
+            if featureCount & 0x3FF == 0 { try Task.checkCancellation() }
+            let admittedID = try PublicCatalogUpdateAdmission.validatePointFeatureData(featureData, decoder: decoder)
+            guard !pathIDs.contains(admittedID) else {
+                throw CoreError("Duplicate public feature identity.")
+            }
+            let place = try LocalDataPack.decodePointFeature(featureData, decoder: decoder)
+            try LocalDataPack.validatePlace(place, metadata: metadata)
+            let street = keyCache[place.address] ?? {
+                let computed = LocalSearch.addressKey(place.address)
+                keyCache[place.address] = computed
+                return computed
+            }()
+            guard !street.isEmpty, metadata.addressesByCommunity[place.communityID]?.contains(street) == true else {
+                throw CoreError("A public location does not match its complete property street identity.")
+            }
+            if metadata.neededRefIDs.contains(place.id) { placesByID[place.id] = place }
+            try writer.insert(place, addressKey: street)
+            featureCount += 1
+        }
+        guard header.schemaVersion == 1, header.type == "FeatureCollection",
+              header.packVersion == catalog.packVersion, featureCount > 0 else {
+            throw CoreError("The public catalog payload has no matching usable catalog.")
+        }
+        try LocalDataPack.validateAssociationsAndFloors(catalog: catalog, placesByID: placesByID, metadata: metadata)
+        let store = try writer.finish()
+        return (catalog, segments, store, indexBytes)
+    }
+
     private func admission(_ manifest: PublicCatalogUpdateManifest, state: State?) throws -> Bool {
-        // Callers cannot construct a different decoded manifest that bypasses the raw manifest limits.
         _ = try PublicCatalogUpdateManifest.read(PublicCatalogUpdateJSON.encode(manifest))
         let identity = try manifest.identity
         guard let state else { return true }
@@ -159,8 +415,6 @@ public struct PublicCatalogUpdateStore: Sendable {
             guard old.sequence == manifest.sequence, old.manifestSHA256 == identity else { throw CoreError("A public catalog revision was reused with different content.") }
             if state.active.revision == manifest.revision, state.active.sequence == manifest.sequence,
                state.active.manifestSHA256 == identity {
-                // Only the identical accepted manifest can repair its corrupt local generation.
-                // Rejected revisions and different bytes have already been refused above.
                 return (try? readGeneration(state.active, fullPack: false, recovered: false)) == nil
             }
             throw CoreError("An older public catalog revision cannot be replayed.")
@@ -196,7 +450,6 @@ public struct PublicCatalogUpdateStore: Sendable {
     private func resolve(fullPack: Bool) throws -> (State, Resolved)? {
         guard let state = try readState() else { return nil }
         if let result = try? resolve(state, fullPack: fullPack) { return (state, result) }
-        // A Share read may overlap activation/pruning. Retry only after observing a new pointer.
         if let next = try readState(), next.active.generation != state.active.generation || next.previous?.generation != state.previous?.generation,
            let result = try? resolve(next, fullPack: fullPack) { return (next, result) }
         throw CoreError("The installed public catalog could not be verified. Bundled data remains available.")
@@ -207,11 +460,51 @@ public struct PublicCatalogUpdateStore: Sendable {
            let result = try? readGeneration(previous, fullPack: fullPack, recovered: true) { return result }
         throw CoreError("No intact selected public catalog generation is available.")
     }
+
+    private func resolveIndexed(buildLargeIndexInline: Bool) throws -> (State, ResolvedIndexed)? {
+        guard let state = try readState() else { return nil }
+        if let result = try? resolveIndexed(state, buildLargeIndexInline: buildLargeIndexInline) { return (state, result) }
+        if let next = try readState(), next.active.generation != state.active.generation || next.previous?.generation != state.previous?.generation,
+           let result = try? resolveIndexed(next, buildLargeIndexInline: buildLargeIndexInline) { return (next, result) }
+        throw CoreError("The installed public catalog could not be verified. Bundled data remains available.")
+    }
+    private func resolveIndexed(_ state: State, buildLargeIndexInline: Bool) throws -> ResolvedIndexed {
+        if let active = try? readGenerationIndexed(state.active, recovered: false, buildLargeIndexInline: buildLargeIndexInline) { return active }
+        if let previous = state.previous, !state.rejectedRevisions.contains(previous.revision),
+           let result = try? readGenerationIndexed(previous, recovered: true, buildLargeIndexInline: buildLargeIndexInline) { return result }
+        throw CoreError("No intact selected public catalog generation is available.")
+    }
+
     private func canRollback(_ state: State, selected: Reference) -> Bool {
         guard selected.generation == state.active.generation, let previous = state.previous,
               previous.generation != selected.generation, !state.rejectedRevisions.contains(previous.revision) else { return false }
         return (try? readGeneration(previous, fullPack: false, recovered: false)) != nil
     }
+
+    private func readGenerationIndexed(_ reference: Reference, recovered: Bool, buildLargeIndexInline: Bool) throws -> ResolvedIndexed {
+        let verified = try readGeneration(reference, fullPack: false, recovered: recovered)
+        let generation = generationsURL.appendingPathComponent(reference.generation, isDirectory: true)
+        let dbURL = generation.appendingPathComponent("places.sqlite")
+        let locationsSHA256 = verified.manifest.files["public-locations.geojson"]!.sha256
+
+        if let store = try? PublicPlaceStore(url: dbURL, expectedLocationsSHA256: locationsSHA256) {
+            let catalogData = try DataPackPayload.boundedData(generation.appendingPathComponent("public-catalog.json"), maximum: PublicCatalogUpdateManifest.limits["public-catalog.json"]!)
+            let pathsData = try DataPackPayload.boundedData(generation.appendingPathComponent("public-paths.geojson"), maximum: PublicCatalogUpdateManifest.limits["public-paths.geojson"]!)
+            let catalog = try JSONDecoder().decode(Catalog.self, from: catalogData)
+            let metadata = try LocalDataPack.validateCatalogMetadata(catalog)
+            let segments = try LocalDataPack.readPaths(pathsData, catalog: catalog, metadata: metadata)
+            return ResolvedIndexed(reference: reference, manifest: verified.manifest, catalog: catalog,
+                                   paths: segments, placeStore: store, recovered: recovered)
+        }
+
+        if !buildLargeIndexInline, needsIndexBuild(for: reference) {
+            throw CoreError("Public pin index needs background build.")
+        }
+        let (catalog, segments, store, _) = try validateAndIndexGeneration(generation, manifest: verified.manifest)
+        return ResolvedIndexed(reference: reference, manifest: verified.manifest, catalog: catalog,
+                               paths: segments, placeStore: store, recovered: recovered)
+    }
+
     private func readGeneration(_ reference: Reference, fullPack: Bool, recovered: Bool) throws -> Resolved {
         guard UUID(uuidString: reference.generation) != nil else { throw CoreError("Invalid public catalog generation identity.") }
         try DataPackPayload.checkDirectory(generationsURL)
@@ -275,7 +568,6 @@ public struct PublicCatalogUpdateStore: Sendable {
         let live = Set([state.active.generation, state.previous?.generation].compactMap { $0 })
         guard let entries = try? FileManager.default.contentsOfDirectory(at: generationsURL, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
         for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil && !live.contains(entry.lastPathComponent) {
-            // Unknown directories, including UUID-named foreign folders, are not ours to remove.
             guard let owner = try? DataPackPayload.boundedData(entry.appendingPathComponent("public-generation-owner"), maximum: 80),
                   owner == Data(entry.lastPathComponent.utf8) else { continue }
             removeOwnedGeneration(entry.lastPathComponent)

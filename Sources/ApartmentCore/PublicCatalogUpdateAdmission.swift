@@ -14,8 +14,6 @@ enum PublicCatalogUpdateAdmission {
     private static let pathRequired = ["communityID", "fromNode", "toNode", "mode", "oneWay", "blocked", "stairs", "confirmed", "sourceIDs", "notes"]
     private static let estimateAllowed = estimateRequired.union(["dwellingFloor", "sourceUnitID", "sourceDate"])
     private static let estimateRequiredList = Array(estimateRequired)
-    private static let collectionAllowed: Set<String> = ["type", "schemaVersion", "packVersion", "features"]
-    private static let collectionRequired = ["type", "schemaVersion", "packVersion", "features"]
     private static let featureAllowed: Set<String> = ["type", "id", "geometry", "properties"]
     private static let featureRequired = ["type", "id", "geometry", "properties"]
     private static let geometryAllowed: Set<String> = ["type", "coordinates"]
@@ -23,9 +21,9 @@ enum PublicCatalogUpdateAdmission {
     private static let coordinateAllowed: Set<String> = ["latitude", "longitude"]
     private static let coordinateRequired = ["latitude", "longitude"]
 
-    static func validate(_ files: [String: Data]) throws {
+    static func validateCatalog(_ data: Data) throws {
         try withAutoreleasePool {
-            let catalog = try object(JSONSerialization.jsonObject(with: files["public-catalog.json"]!), allowed: catalogKeys,
+            let catalog = try object(JSONSerialization.jsonObject(with: data), allowed: catalogKeys,
                                      required: ["schemaVersion", "packVersion", "generatedAt", "scopeZIPs", "sources", "communities", "coverage"])
             let sources = try objects(catalog["sources"])
             for source in sources {
@@ -59,14 +57,39 @@ enum PublicCatalogUpdateAdmission {
             let exceptionKeys: Set<String> = ["communityID", "address", "postalZIP", "propertyAPN", "currentCountyAPN", "identitySourceID", "countySourceID", "boundarySourceID", "cadastralSourceID"]
             for exception in try optionalObjects(catalog["deliveryAreaExceptions"]) { _ = try object(exception, allowed: exceptionKeys, required: exceptionKeys) }
         }
+    }
 
-        // Stream-validate GeoJSON collections via pure-Swift JSONDecoder without materializing a >1 GB NSDictionary DOM.
-        let locationIDs: Set<String> = try withAutoreleasePool {
-            try JSONDecoder().decode(ValidatedPointCollection.self, from: files["public-locations.geojson"]!).ids
+    static func validatePointFeatureData(_ data: Data, decoder: JSONDecoder = JSONDecoder()) throws -> String {
+        try decoder.decode(ValidatedPointFeature.self, from: data).id
+    }
+
+    static func validatePathFeatureData(_ data: Data, decoder: JSONDecoder = JSONDecoder()) throws -> String {
+        try decoder.decode(ValidatedPathFeature.self, from: data).id
+    }
+
+    static func validatePaths(_ data: Data) throws -> Set<String> {
+        let decoder = JSONDecoder()
+        var ids = Set<String>()
+        _ = try StreamingGeoJSON.scan(data: data) { featureData in
+            let id = try validatePathFeatureData(featureData, decoder: decoder)
+            guard ids.insert(id).inserted else {
+                throw CoreError("Duplicate public feature identity.")
+            }
         }
-        let pathIDs: Set<String> = try withAutoreleasePool {
-            try JSONDecoder().decode(ValidatedPathCollection.self, from: files["public-paths.geojson"]!).ids
+        return ids
+    }
+
+    static func validate(_ files: [String: Data]) throws {
+        try validateCatalog(files["public-catalog.json"]!)
+        let decoder = JSONDecoder()
+        var locationIDs = Set<String>()
+        _ = try StreamingGeoJSON.scan(data: files["public-locations.geojson"]!) { featureData in
+            let id = try validatePointFeatureData(featureData, decoder: decoder)
+            guard locationIDs.insert(id).inserted else {
+                throw CoreError("Duplicate public feature identity.")
+            }
         }
+        let pathIDs = try validatePaths(files["public-paths.geojson"]!)
         guard locationIDs.isDisjoint(with: pathIDs) else {
             throw CoreError("Duplicate public feature identity.")
         }
@@ -94,93 +117,83 @@ enum PublicCatalogUpdateAdmission {
         }
     }
 
-    private struct ValidatedPointCollection: Decodable {
-        let ids: Set<String>
+    private struct ValidatedPointFeature: Decodable {
+        let id: String
+        private static let idKey = DynamicKey("id")
+        private static let geometryKey = DynamicKey("geometry")
+        private static let propertiesKey = DynamicKey("properties")
+        private static let kindKey = DynamicKey("kind")
+        private static let verificationKey = DynamicKey("verification")
+        private static let estimateKey = DynamicKey("entranceSideEstimate")
+        private static let frontageKey = DynamicKey("frontage")
+        private static let estimateFlags = [
+            DynamicKey("uncertaintyCalibrated"), DynamicKey("doorCoordinatesVerified"),
+            DynamicKey("entranceCoordinatesVerified"), DynamicKey("physicalSignageVerified")
+        ]
+
         init(from decoder: Decoder) throws {
-            let root = try decoder.container(keyedBy: DynamicKey.self)
-            try PublicCatalogUpdateAdmission.checkKeys(root, allowed: PublicCatalogUpdateAdmission.collectionAllowed,
-                                                       required: PublicCatalogUpdateAdmission.collectionRequired)
-            var features = try root.nestedUnkeyedContainer(forKey: DynamicKey("features"))
-            var seen = Set<String>()
-            if let count = features.count { seen.reserveCapacity(count) }
-            let idKey = DynamicKey("id"), geometryKey = DynamicKey("geometry"), propertiesKey = DynamicKey("properties")
-            let kindKey = DynamicKey("kind"), verificationKey = DynamicKey("verification")
-            let estimateKey = DynamicKey("entranceSideEstimate"), frontageKey = DynamicKey("frontage")
-            let estimateFlags = [
-                DynamicKey("uncertaintyCalibrated"), DynamicKey("doorCoordinatesVerified"),
-                DynamicKey("entranceCoordinatesVerified"), DynamicKey("physicalSignageVerified")
-            ]
-            while !features.isAtEnd {
-                let feature = try features.nestedContainer(keyedBy: DynamicKey.self)
-                try PublicCatalogUpdateAdmission.checkKeys(feature, allowed: PublicCatalogUpdateAdmission.featureAllowed,
-                                                           required: PublicCatalogUpdateAdmission.featureRequired)
-                guard let id = try? feature.decode(String.self, forKey: idKey),
-                      seen.insert(id).inserted else {
-                    throw CoreError("Duplicate public feature identity.")
-                }
-                let geometry = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: geometryKey)
-                try PublicCatalogUpdateAdmission.checkKeys(geometry, allowed: PublicCatalogUpdateAdmission.geometryAllowed,
-                                                           required: PublicCatalogUpdateAdmission.geometryRequired)
-                let properties = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: propertiesKey)
-                try PublicCatalogUpdateAdmission.checkKeys(properties, allowed: PublicCatalogUpdateAdmission.pointKeys,
-                                                           required: PublicCatalogUpdateAdmission.pointRequired)
-                guard let kind = try? properties.decode(String.self, forKey: kindKey),
-                      kind == "building" || kind == "unitPosition",
-                      let verification = try? properties.decode(String.self, forKey: verificationKey),
-                      verification == "sourceMapped" || verification == "estimated" else {
-                    throw CoreError("A public update cannot assert a checked door or entrance.")
-                }
-                if properties.contains(estimateKey), !(try properties.decodeNil(forKey: estimateKey)) {
-                    let estimate = try properties.nestedContainer(keyedBy: DynamicKey.self, forKey: estimateKey)
-                    try PublicCatalogUpdateAdmission.checkKeys(estimate, allowed: PublicCatalogUpdateAdmission.estimateAllowed,
-                                                               required: PublicCatalogUpdateAdmission.estimateRequiredList)
-                    for flag in estimateFlags {
-                        guard (try? estimate.decode(Bool.self, forKey: flag)) == false else {
-                            throw CoreError("Public entrance estimates must remain explicitly unverified.")
-                        }
+            let feature = try decoder.container(keyedBy: DynamicKey.self)
+            try PublicCatalogUpdateAdmission.checkKeys(feature, allowed: PublicCatalogUpdateAdmission.featureAllowed,
+                                                       required: PublicCatalogUpdateAdmission.featureRequired)
+            guard let id = try? feature.decode(String.self, forKey: Self.idKey) else {
+                throw CoreError("Duplicate public feature identity.")
+            }
+            let geometry = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.geometryKey)
+            try PublicCatalogUpdateAdmission.checkKeys(geometry, allowed: PublicCatalogUpdateAdmission.geometryAllowed,
+                                                       required: PublicCatalogUpdateAdmission.geometryRequired)
+            let properties = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.propertiesKey)
+            try PublicCatalogUpdateAdmission.checkKeys(properties, allowed: PublicCatalogUpdateAdmission.pointKeys,
+                                                       required: PublicCatalogUpdateAdmission.pointRequired)
+            guard let kind = try? properties.decode(String.self, forKey: Self.kindKey),
+                  kind == "building" || kind == "unitPosition",
+                  let verification = try? properties.decode(String.self, forKey: Self.verificationKey),
+                  verification == "sourceMapped" || verification == "estimated" else {
+                throw CoreError("A public update cannot assert a checked door or entrance.")
+            }
+            if properties.contains(Self.estimateKey), !(try properties.decodeNil(forKey: Self.estimateKey)) {
+                let estimate = try properties.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.estimateKey)
+                try PublicCatalogUpdateAdmission.checkKeys(estimate, allowed: PublicCatalogUpdateAdmission.estimateAllowed,
+                                                           required: PublicCatalogUpdateAdmission.estimateRequiredList)
+                for flag in Self.estimateFlags {
+                    guard (try? estimate.decode(Bool.self, forKey: flag)) == false else {
+                        throw CoreError("Public entrance estimates must remain explicitly unverified.")
                     }
-                    var frontage = try estimate.nestedUnkeyedContainer(forKey: frontageKey)
-                    while !frontage.isAtEnd {
-                        let coord = try frontage.nestedContainer(keyedBy: DynamicKey.self)
-                        try PublicCatalogUpdateAdmission.checkKeys(coord, allowed: PublicCatalogUpdateAdmission.coordinateAllowed,
-                                                                   required: PublicCatalogUpdateAdmission.coordinateRequired)
-                    }
+                }
+                var frontage = try estimate.nestedUnkeyedContainer(forKey: Self.frontageKey)
+                while !frontage.isAtEnd {
+                    let coord = try frontage.nestedContainer(keyedBy: DynamicKey.self)
+                    try PublicCatalogUpdateAdmission.checkKeys(coord, allowed: PublicCatalogUpdateAdmission.coordinateAllowed,
+                                                               required: PublicCatalogUpdateAdmission.coordinateRequired)
                 }
             }
-            ids = seen
+            self.id = id
         }
     }
 
-    private struct ValidatedPathCollection: Decodable {
-        let ids: Set<String>
+    private struct ValidatedPathFeature: Decodable {
+        let id: String
+        private static let idKey = DynamicKey("id")
+        private static let geometryKey = DynamicKey("geometry")
+        private static let propertiesKey = DynamicKey("properties")
+        private static let confirmedKey = DynamicKey("confirmed")
+
         init(from decoder: Decoder) throws {
-            let root = try decoder.container(keyedBy: DynamicKey.self)
-            try PublicCatalogUpdateAdmission.checkKeys(root, allowed: PublicCatalogUpdateAdmission.collectionAllowed,
-                                                       required: PublicCatalogUpdateAdmission.collectionRequired)
-            var features = try root.nestedUnkeyedContainer(forKey: DynamicKey("features"))
-            var seen = Set<String>()
-            if let count = features.count { seen.reserveCapacity(count) }
-            let idKey = DynamicKey("id"), geometryKey = DynamicKey("geometry"), propertiesKey = DynamicKey("properties")
-            let confirmedKey = DynamicKey("confirmed")
-            while !features.isAtEnd {
-                let feature = try features.nestedContainer(keyedBy: DynamicKey.self)
-                try PublicCatalogUpdateAdmission.checkKeys(feature, allowed: PublicCatalogUpdateAdmission.featureAllowed,
-                                                           required: PublicCatalogUpdateAdmission.featureRequired)
-                guard let id = try? feature.decode(String.self, forKey: idKey),
-                      seen.insert(id).inserted else {
-                    throw CoreError("Duplicate public feature identity.")
-                }
-                let geometry = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: geometryKey)
-                try PublicCatalogUpdateAdmission.checkKeys(geometry, allowed: PublicCatalogUpdateAdmission.geometryAllowed,
-                                                           required: PublicCatalogUpdateAdmission.geometryRequired)
-                let properties = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: propertiesKey)
-                try PublicCatalogUpdateAdmission.checkKeys(properties, allowed: PublicCatalogUpdateAdmission.pathKeys,
-                                                           required: PublicCatalogUpdateAdmission.pathRequired)
-                guard (try? properties.decode(Bool.self, forKey: confirmedKey)) == false else {
-                    throw CoreError("A public update cannot assert a personally confirmed path.")
-                }
+            let feature = try decoder.container(keyedBy: DynamicKey.self)
+            try PublicCatalogUpdateAdmission.checkKeys(feature, allowed: PublicCatalogUpdateAdmission.featureAllowed,
+                                                       required: PublicCatalogUpdateAdmission.featureRequired)
+            guard let id = try? feature.decode(String.self, forKey: Self.idKey) else {
+                throw CoreError("Duplicate public feature identity.")
             }
-            ids = seen
+            let geometry = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.geometryKey)
+            try PublicCatalogUpdateAdmission.checkKeys(geometry, allowed: PublicCatalogUpdateAdmission.geometryAllowed,
+                                                       required: PublicCatalogUpdateAdmission.geometryRequired)
+            let properties = try feature.nestedContainer(keyedBy: DynamicKey.self, forKey: Self.propertiesKey)
+            try PublicCatalogUpdateAdmission.checkKeys(properties, allowed: PublicCatalogUpdateAdmission.pathKeys,
+                                                       required: PublicCatalogUpdateAdmission.pathRequired)
+            guard (try? properties.decode(Bool.self, forKey: Self.confirmedKey)) == false else {
+                throw CoreError("A public update cannot assert a personally confirmed path.")
+            }
+            self.id = id
         }
     }
 

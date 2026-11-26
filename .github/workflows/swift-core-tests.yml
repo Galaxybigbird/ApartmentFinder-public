@@ -1,0 +1,38 @@
+name: Swift Core Tests and Wave 36 RAM Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_live_wave_benchmark:
+        description: Download live Wave 36+ catalog and measure peak RSS during streaming SQLite install
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  swift-core:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ApartmentCore Swift unit tests
+        run: swift test --disable-automatic-resolution --skip-update
+
+      - name: Live Wave 36 streaming install & peak RSS verification
+        if: ${{ inputs.run_live_wave_benchmark }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift build -c release --build-tests --disable-automatic-resolution --skip-update
+          RUN_LIVE_WAVE36_BENCH=1 /usr/bin/time -l swift test -c release --skip-build --filter testLiveWave36StreamingInstallAndPeakRSS 2>&1 | tee "$RUNNER_TEMP/bench.log"
+          # Extract the child xctest / swift-test maximum resident set size
+          PEAK_BYTES=$(awk '/maximum resident set size/ {print $1}' "$RUNNER_TEMP/bench.log" | tail -n 1)
+          PEAK_MB=$(python3 -c "print(round($PEAK_BYTES / 1048576.0, 2))")
+          echo "=== OS-MEASURED PEAK RSS: ${PEAK_MB} MB (${PEAK_BYTES} bytes) ==="
+          python3 -c "assert $PEAK_MB < 250.0, f'Peak RSS too high: {$PEAK_MB} MB'"

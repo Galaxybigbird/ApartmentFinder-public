@@ -77,8 +77,8 @@ struct LibraryView: View {
             List {
                 Section("On this phone") {
                     LabeledContent("Communities",value: "\(store.communities.count)")
-                    LabeledContent("Mapped unit positions",value: "\(store.pack?.places.filter { $0.kind == .unitPosition }.count ?? 0)")
-                    LabeledContent("Verified doors",value: "\(store.places.filter { $0.kind == .door && $0.verification == .fieldVerified }.count)")
+                    LabeledContent("Mapped unit positions",value: "\(store.unitPositionCount)")
+                    LabeledContent("Verified doors",value: "\(store.verifiedDoorCount)")
                     LabeledContent("Personal pins / paths",value: "\(store.personal.places.count) / \(store.personal.paths.count)")
                     Text("Inventory research is incomplete. Mapped unit positions do not establish exact doors.").font(.caption).foregroundStyle(.orange)
                     Text("Map pack \(store.pack?.catalog.packVersion ?? "not loaded")").font(.caption).foregroundStyle(.secondary)
@@ -119,7 +119,7 @@ struct LibraryView: View {
                         } label: {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(community.name)
-                                Text("\(community.zip) · \(store.places.filter { $0.communityID == community.id }.count) positions").font(.caption).foregroundStyle(.secondary)
+                                Text("\(community.zip) · \(store.placeCount(in: community.id)) positions").font(.caption).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -155,7 +155,7 @@ private struct CoverageDetail: View {
     var community: Community
     var editPin: (Place) -> Void
     var editPath: (PathSegment) -> Void
-    private var places: [Place] { store.places.filter { $0.communityID == community.id } }
+    private var places: [Place] { store.places(in: community.id) }
     var body: some View {
         List {
             Section("Evidence") {

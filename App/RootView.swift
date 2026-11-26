@@ -16,7 +16,12 @@ struct RootView: View {
     var body: some View {
         // Allocate banner space outside navigation bars, keeping their controls reachable.
         VStack(spacing: 0) {
-            if store.requiresPrivatePack {
+            if store.catalogIndexingPending {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Preparing offline pin index…").font(.subheadline)
+                }.padding(10).frame(maxWidth: .infinity).background(.regularMaterial)
+            } else if store.requiresPrivatePack {
                 VStack(spacing: 6) {
                     Text("Private map data is not installed.").font(.subheadline)
                     Button("Import private map pack", systemImage: "folder") { importingPack = true }
@@ -291,7 +296,7 @@ private struct FinderView: View {
                 let selectedID = selected?.id
                 if searched { refreshMatches() }
                 if let selectedID {
-                    selected = store.places.first { $0.id == selectedID }
+                    selected = store.place(id: selectedID)
                     if let selected { communityID = selected.communityID }
                 }
                 // Moving a pin can invalidate its graph connection; an old route must not stay active.
@@ -327,8 +332,8 @@ private struct FinderView: View {
     #endif
     private func refreshAfterPublicCatalogUpdate() {
         let previousSelection = selected
-        let currentSelection = previousSelection.flatMap { previous in store.places.first { $0.id == previous.id } }
-        let currentApproach = currentSelection?.approachID.flatMap { id in store.places.first { $0.id == id } }
+        let currentSelection = previousSelection.flatMap { previous in store.place(id: previous.id) }
+        let currentApproach = currentSelection?.approachID.flatMap { id in store.place(id: id) }
         let targetChanged = !sameNavigationTarget(previousSelection, currentSelection) ||
             !sameNavigationTarget(selectedApproach, currentApproach)
         let usedPathChanged = navigation.route?.edgeIDs.contains { id in
@@ -353,7 +358,7 @@ private struct FinderView: View {
     }
     private func rememberPublicNavigationInputs() {
         appliedPublicPaths = store.paths
-        selectedApproach = selected?.approachID.flatMap { id in store.places.first { $0.id == id } }
+        selectedApproach = selected?.approachID.flatMap { id in store.place(id: id) }
     }
     private func sameNavigationTarget(_ previous: Place?, _ current: Place?) -> Bool {
         guard let previous, let current else { return previous == nil && current == nil }
@@ -375,8 +380,9 @@ private struct FinderView: View {
     private func refreshAfterPackReplacement() {
         let selectedID = selected?.id, previousCommunity = communityID
         if searched { refreshMatches() }
+        let selectedCandidate = selectedID.flatMap { store.place(id: $0) }.map { [$0] } ?? []
         let current = FinderPackRefresh.make(selectedID: selectedID, communityID: previousCommunity,
-            places: store.places, communities: store.communities,
+            places: selectedCandidate, communities: store.communities,
             matches: searched ? matches : nil, searchCommunityID: searched ? communityID : nil)
         selected = current.selected; communityID = current.communityID
         if address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -451,7 +457,7 @@ private struct FinderView: View {
                     .accessibilityIdentifier("finder.correct.\(place.id)")
             }
             Button("Navigate public roads to approach",systemImage: "car.fill") {
-                guard let id = place.approachID, let approach = store.places.first(where: { $0.id == id && $0.communityID == place.communityID }),
+                guard let id = place.approachID, let approach = store.place(id: id), approach.communityID == place.communityID,
                       approach.kind == .entrance, approach.verification == .fieldVerified else {
                     store.errorMessage = "Add a field-verified vehicle entrance and link it as this pin's vehicle approach first."; return
                 }
@@ -628,7 +634,9 @@ struct LocalRoutePlanner: View {
     private var nodes: [GraphNode] { graphNodes(paths: paths,mode: mode) }
     private var target: Place? {
         if mode == .walk { return destination }
-        return store.places.first { $0.id == destination.approachID && $0.communityID == destination.communityID && $0.kind == .entrance }
+        guard let approachID = destination.approachID, let approach = store.place(id: approachID),
+              approach.communityID == destination.communityID, approach.kind == .entrance else { return nil }
+        return approach
     }
     private var identity: RoutePreviewIdentity {
         RoutePreviewIdentity(destinationID: destination.id, communityID: destination.communityID,

@@ -46,6 +46,47 @@ public struct PublicCatalogUpdateClient: Sendable {
         try Task.checkCancellation()
         return try PublicCatalogUpdatePayload(manifestData: manifestData, files: files)
     }
+
+    /// Streams one public catalog file to disk and verifies its manifest length and SHA-256
+    /// without ever holding a 200+ MB decompressed payload in memory.
+    func fetchFile(named name: String, manifest: PublicCatalogUpdateManifest, to outputURL: URL) async throws {
+        try Task.checkCancellation()
+        guard let descriptor = manifest.files[name], let limit = PublicCatalogUpdateManifest.limits[name] else {
+            throw CoreError("Unexpected public catalog payload files.")
+        }
+        if manifest.schemaVersion == 2 {
+            guard descriptor.encoding == "gzip",
+                  let compressedBytes = descriptor.compressedBytes,
+                  let compressedSHA256 = descriptor.compressedSHA256 else {
+                throw CoreError("Invalid compressed public catalog descriptor.")
+            }
+            let url = Self.latestURL.deletingLastPathComponent().appendingPathComponent("revisions").appendingPathComponent(manifest.revision).appendingPathComponent(name + ".gz")
+            let compressed = try await fetch(url, compressedBytes)
+            try Task.checkCancellation()
+            guard compressed.count == compressedBytes,
+                  try PublicCatalogUpdateIntegrity.digest(compressed) == compressedSHA256 else {
+                throw CoreError("The downloaded compressed public catalog file does not match its manifest.")
+            }
+            let (written, sha256) = try PublicCatalogGzip.decompress(compressed, to: outputURL, expectedBytes: descriptor.bytes, maximumBytes: limit)
+            guard written == descriptor.bytes, written <= limit, sha256 == descriptor.sha256 else {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw CoreError("The public catalog payload does not match its manifest.")
+            }
+        } else {
+            let url = Self.latestURL.deletingLastPathComponent().appendingPathComponent("revisions").appendingPathComponent(manifest.revision).appendingPathComponent(name)
+            let data = try await fetch(url, descriptor.bytes)
+            try Task.checkCancellation()
+            guard data.count == descriptor.bytes, data.count <= limit,
+                  try PublicCatalogUpdateIntegrity.digest(data) == descriptor.sha256 else {
+                throw CoreError("The public catalog payload does not match its manifest.")
+            }
+            #if os(iOS)
+            try data.write(to: outputURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            #else
+            try data.write(to: outputURL, options: .atomic)
+            #endif
+        }
+    }
 }
 
 public enum PublicCatalogUpdateTransport {

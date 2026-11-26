@@ -18,6 +18,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var packRevision: UInt64 = 0
     @Published private(set) var privatePackImportPending = false
     @Published private(set) var catalogRefreshPending = false
+    @Published private(set) var catalogIndexingPending = false
     @Published private(set) var publicCatalogRevisionLabel = "Bundled pin data"
     @Published private(set) var publicCatalogUpdateStatus = "Pin data is available offline."
     @Published private(set) var canRollbackPublicCatalog = false
@@ -30,6 +31,12 @@ final class AppStore: ObservableObject {
     private let completionTransaction = DeliveryCompletionTransaction()
     private var mergedPlaces: [Place] = []
     private var apartmentPlacesByCommunity: [String: [Place]] = [:]
+    private var indexedPublicCatalog: IndexedPublicCatalogSelection?
+    private var indexedOverlayPlaces: [Place] = []
+    private var indexedOverlayByCommunity: [String: [Place]] = [:]
+    private var indexedPolicy: PublicCatalogSupplement.IndexedPolicy?
+    private var indexedPlaceCache: [String: [Place]] = [:]
+    private var indexedPlaceCacheOrder: [String] = []
     private var scopedApartmentPlaces: [String: [Place]] = [:]
     private var buildingAssociationsByCommunity: [String: [UnitBuildingAssociation]] = [:]
     private var floorReferencesByCommunity: [String: [UnitFloorReference]] = [:]
@@ -42,27 +49,92 @@ final class AppStore: ObservableObject {
     private var privatePackStore: PrivateDataPackStore?
     private var publicCatalogSupplement: LocalDataPack?
     private var publicOwnershipView: LocalDataPack?
+    private var reviewedBaselineManifest: PublicCatalogUpdateManifest?
     private var reviewedBaseline: (manifest: PublicCatalogUpdateManifest, pack: LocalDataPack)?
     private var reviewedOverlay: LocalDataPack?
     private var reviewedOverlayAllowed = false
+    private var resourceBundleRef: Bundle = .main
+    private var backgroundIndexTask: Task<Void, Never>?
     private var loadedBasePack: LocalDataPack?
     private var publicCatalogStore: PublicCatalogUpdateStore?
     private let publicCatalogClient: PublicCatalogUpdateClient
     private let publicCatalogUpdatesEnabled: Bool
     private var lastPublicCatalogCheck: Date?
-    var requiresPrivatePack: Bool { pack == nil }
+    var requiresPrivatePack: Bool { pack == nil && !catalogIndexingPending }
 
     var communities: [Community] {
         PersonalCommunityDirectory.applying(places: personal.places, rules: personal.apartmentRules,
             to: pack?.catalog.communities ?? [])
     }
     var knownApartmentAddresses: [String] { communities.flatMap(\.matchingAddresses) + personal.apartmentRules.map(\.address) + personal.apartmentRules.compactMap(\.matchingAddress) }
-    var places: [Place] { mergedPlaces }
-    /// Reuse the index rebuilt with catalog/personal changes instead of scanning
-    /// the entire valley on every live-location redraw of Finder.
+    var places: [Place] {
+        guard let indexed = indexedPublicCatalog, let policy = indexedPolicy else { return mergedPlaces }
+        let basePlaces = loadedBasePack?.places ?? []
+        let filteredPublic = PublicCatalogSupplement.filterIndexedPlaces(
+            indexed.placeStore.allPlaces() + indexedOverlayPlaces,
+            policy: policy,
+            basePlaces: basePlaces
+        )
+        return LocalSearch.merged(seed: basePlaces + filteredPublic, overrides: personal.places)
+    }
+    var unitPositionCount: Int {
+        if let indexed = indexedPublicCatalog {
+            return indexed.placeStore.unitPositionCount +
+                indexedOverlayPlaces.filter { $0.kind == .unitPosition }.count +
+                (loadedBasePack?.places.filter { $0.kind == .unitPosition }.count ?? 0)
+        }
+        return pack?.places.filter { $0.kind == .unitPosition }.count ?? 0
+    }
+    var verifiedDoorCount: Int {
+        if indexedPublicCatalog != nil {
+            let base = loadedBasePack?.places.filter { $0.kind == .door && $0.verification == .fieldVerified } ?? []
+            let personalDoors = personal.places.filter { $0.kind == .door && $0.verification == .fieldVerified }
+            return LocalSearch.merged(seed: base, overrides: personalDoors).count
+        }
+        return mergedPlaces.filter { $0.kind == .door && $0.verification == .fieldVerified }.count
+    }
+    func placeCount(in communityID: String) -> Int {
+        if let indexed = indexedPublicCatalog {
+            let publicCount = (indexed.placeStore.communityCounts[communityID] ?? 0) +
+                (indexedOverlayByCommunity[communityID]?.count ?? 0)
+            let baseCount = loadedBasePack?.places.filter { $0.communityID == communityID }.count ?? 0
+            let personalCount = personal.places.filter { $0.communityID == communityID }.count
+            return publicCount + baseCount + personalCount
+        }
+        return apartmentPlacesByCommunity[communityID]?.count ?? 0
+    }
+    func place(id: String) -> Place? {
+        if let personalMatch = personal.places.first(where: { $0.id == id }) { return personalMatch }
+        guard let indexed = indexedPublicCatalog, let policy = indexedPolicy else {
+            return mergedPlaces.first { $0.id == id }
+        }
+        if let baseMatch = loadedBasePack?.places.first(where: { $0.id == id }) { return baseMatch }
+        if let candidate = indexedOverlayPlaces.first(where: { $0.id == id }) ?? indexed.placeStore.place(id: id) {
+            let baseInCommunity = loadedBasePack?.places.filter { $0.communityID == candidate.communityID } ?? []
+            return PublicCatalogSupplement.filterIndexedPlaces([candidate], policy: policy, basePlaces: baseInCommunity).first
+        }
+        return nil
+    }
+    /// Reuse the index rebuilt with catalog/personal changes (or bounded SQLite LRU cache)
+    /// instead of scanning or holding the entire valley in RAM on every redraw of Finder.
     func places(in communityID: String?) -> [Place] {
         guard let communityID else { return [] }
-        return apartmentPlacesByCommunity[communityID] ?? []
+        guard let indexed = indexedPublicCatalog, let policy = indexedPolicy else {
+            return apartmentPlacesByCommunity[communityID] ?? []
+        }
+        if let cached = indexedPlaceCache[communityID] { return cached }
+        let basePlaces = loadedBasePack?.places.filter { $0.communityID == communityID } ?? []
+        let rawPublic = indexed.placeStore.places(in: communityID) + (indexedOverlayByCommunity[communityID] ?? [])
+        let filteredPublic = PublicCatalogSupplement.filterIndexedPlaces(rawPublic, policy: policy, basePlaces: basePlaces)
+        let personalInCommunity = personal.places.filter { $0.communityID == communityID }
+        let merged = LocalSearch.merged(seed: basePlaces + filteredPublic, overrides: personalInCommunity)
+        indexedPlaceCache[communityID] = merged
+        indexedPlaceCacheOrder.append(communityID)
+        if indexedPlaceCacheOrder.count > 24 {
+            let evicted = indexedPlaceCacheOrder.removeFirst()
+            indexedPlaceCache.removeValue(forKey: evicted)
+        }
+        return merged
     }
     var paths: [PathSegment] {
         var records = Dictionary((pack?.paths ?? []).map { ($0.id,$0) }, uniquingKeysWith: { _,last in last })
@@ -70,7 +142,7 @@ final class AppStore: ObservableObject {
         return records.values.sorted { $0.id < $1.id }
     }
     var selectedCommunity: Community? { communities.first { $0.id == selectedCommunityID } }
-    var communityPlaces: [Place] { places.filter { $0.communityID == selectedCommunityID && $0.referenceKind == nil } }
+    var communityPlaces: [Place] { places(in: selectedCommunityID).filter { $0.referenceKind == nil } }
     var communityPaths: [PathSegment] { paths.filter { $0.communityID == selectedCommunityID } }
 
     init(storeURL: URL? = nil, resourceBundle: Bundle = .main, packDirectory: URL? = nil, loadPublicCatalog: Bool = true,
@@ -111,12 +183,17 @@ final class AppStore: ObservableObject {
         else { context.insert(StoredDocument(key: key, payload: data)) }
     }
     private func loadPack(resourceBundle: Bundle, loadPublicCatalog: Bool) throws {
+        resourceBundleRef = resourceBundle
         if loadPublicCatalog {
             loadPublicSupplement(resourceBundle: resourceBundle)
         }
         defer {
             loadedBasePack = pack
-            if let publicCatalogSupplement {
+            if let indexed = indexedPublicCatalog {
+                let publicFallback = pack == nil
+                pack = supplementedIndexedPack(pack, with: indexed)
+                if publicFallback { packStatus = "Public map catalog loaded" }
+            } else if let publicCatalogSupplement {
                 let publicFallback = pack == nil
                 pack = supplementedPack(pack, with: publicCatalogSupplement)
                 if publicFallback { packStatus = "Public map catalog loaded" }
@@ -163,36 +240,68 @@ final class AppStore: ObservableObject {
     private func loadPublicSupplement(resourceBundle: Bundle) {
         // Failure to read history or the reviewed files must never resurrect a rolled-back selection.
         do {
-            // Keep the verified model and identity. Raw resource bytes are only needed during validation.
-            reviewedBaseline = try ReviewedBundleResources.baseline(from: resourceBundle).map { ($0.manifest, $0.pack) }
-            let baseline = reviewedBaseline
+            // Read only the 451-byte baseline manifest first so launches with Wave 10..36+ skip 36 MB GeoJSON.
+            reviewedBaselineManifest = try ReviewedBundleResources.baselineManifest(from: resourceBundle)
             let overlay = try ReviewedBundleResources.overlay(from: resourceBundle)
-            let snapshot = try publicCatalogStore?.reviewedBundleSelection()
+            let snapshot = try publicCatalogStore?.reviewedBundleIndexedSelection(buildLargeIndexInline: false)
+            if snapshot?.needsBackgroundIndex == true, let store = publicCatalogStore {
+                // Upgrade from a pre-SQLite >10 MB cached generation off the main thread so launch is instant.
+                reviewedOverlay = overlay
+                catalogIndexingPending = true
+                publicCatalogUpdateStatus = "Preparing offline pin index…"
+                backgroundIndexTask = Task { [weak self] in
+                    let result = await Task.detached(priority: .userInitiated) {
+                        try? store.reviewedBundleIndexedSelection(buildLargeIndexInline: true)
+                    }.value
+                    guard let self else { return }
+                    self.catalogIndexingPending = false
+                    if let selected = result?.selection {
+                        self.applyIndexedPublicCatalog(selected, bundleAllowed: result?.bundleAllowed ?? false)
+                        self.publicCatalogUpdateStatus = selected.recoveredPrevious
+                            ? "Using the previous verified pin data. The latest copy could not be verified."
+                            : "Saved pin data is available offline."
+                    } else {
+                        if let fallback = (try? self.loadReviewedBaselineIfNeeded(from: self.resourceBundleRef))?.pack ??
+                            (try? PublicCatalogSupplement.read(from: self.resourceBundleRef)) {
+                            self.publicCatalogSupplement = fallback
+                            self.pack = self.supplementedPack(self.loadedBasePack, with: fallback)
+                            if self.loadedBasePack == nil { self.packStatus = "Public map catalog loaded" }
+                            self.rebuildPlaceIndex()
+                            self.rebuildApartmentPlan()
+                        }
+                        self.publicCatalogUpdateStatus = "Saved pin data could not be verified."
+                    }
+                    self.backgroundIndexTask = nil
+                }
+                return
+            }
             if let selected = snapshot?.selection {
-                publicCatalogSupplement = selected.pack
+                indexedPublicCatalog = selected
                 publicCatalogRevisionLabel = selected.manifest.revision
                 canRollbackPublicCatalog = selected.canRollback
                 publicCatalogUpdateStatus = selected.recoveredPrevious
                     ? "Using the previous verified pin data. The latest copy could not be verified."
                     : "Saved pin data is available offline."
             }
-            if snapshot?.bundleAllowed == true, let baseline, let overlay {
+            if snapshot?.bundleAllowed == true, let baselineManifest = reviewedBaselineManifest, let overlay {
                 let saved = snapshot?.selection
-                let identical = saved?.manifest == baseline.manifest
-                if saved == nil || (saved!.manifest.sequence < baseline.manifest.sequence) {
-                    publicCatalogSupplement = baseline.pack
-                    publicCatalogRevisionLabel = "Bundled · \(baseline.manifest.revision)"
-                    reviewedOverlay = overlay; reviewedOverlayAllowed = true
-                } else if saved!.manifest.sequence > baseline.manifest.sequence || identical {
+                let identical = saved?.manifest == baselineManifest
+                if saved == nil || (saved!.manifest.sequence < baselineManifest.sequence) {
+                    if let baseline = try loadReviewedBaselineIfNeeded(from: resourceBundle) {
+                        indexedPublicCatalog = nil
+                        publicCatalogSupplement = baseline.pack
+                        publicCatalogRevisionLabel = "Bundled · \(baseline.manifest.revision)"
+                        reviewedOverlay = overlay; reviewedOverlayAllowed = true
+                    }
+                } else if saved!.manifest.sequence > baselineManifest.sequence || identical {
                     reviewedOverlay = overlay; reviewedOverlayAllowed = true
                 }
             }
-            if publicCatalogSupplement != nil { return }
+            if indexedPublicCatalog != nil || publicCatalogSupplement != nil { return }
         } catch {
             publicCatalogUpdateStatus = "Saved pin data or reviewed bundle could not be verified."
-            // Existing selection remains available independently when bundle validation failed.
-            if let selected = try? publicCatalogStore?.load() {
-                publicCatalogSupplement = selected.pack
+            if let selected = try? publicCatalogStore?.loadIndexed() {
+                indexedPublicCatalog = selected
                 publicCatalogRevisionLabel = selected.manifest.revision
                 canRollbackPublicCatalog = selected.canRollback
                 return
@@ -203,6 +312,11 @@ final class AppStore: ObservableObject {
             if let publicCatalogSupplement { publicCatalogRevisionLabel = "Bundled · \(publicCatalogSupplement.catalog.packVersion)" }
         } catch { errorMessage = "The bundled public catalog could not be verified. Existing saved data was preserved." }
     }
+    private func loadReviewedBaselineIfNeeded(from bundle: Bundle) throws -> (manifest: PublicCatalogUpdateManifest, pack: LocalDataPack)? {
+        if let reviewedBaseline { return reviewedBaseline }
+        reviewedBaseline = try ReviewedBundleResources.baseline(from: bundle).map { ($0.manifest, $0.pack) }
+        return reviewedBaseline
+    }
     func refreshPublicCatalogIfDue() async { await refreshPublicCatalog(manual: false) }
     func refreshPublicCatalog(manual: Bool = true) async {
         guard publicCatalogUpdatesEnabled, !catalogRefreshPending else { return }
@@ -211,27 +325,28 @@ final class AppStore: ObservableObject {
             publicCatalogUpdateStatus = "Shared pin-data storage is unavailable. The installed map remains usable."
             return
         }
+        if let pendingIndex = backgroundIndexTask {
+            await pendingIndex.value
+        }
         catalogRefreshPending = true
         lastPublicCatalogCheck = .now
         publicCatalogUpdateStatus = "Checking public pin data…"
         defer { catalogRefreshPending = false }
         let client = publicCatalogClient
-        let worker = Task.detached(priority: manual ? .userInitiated : .utility) { () async throws -> (PublicCatalogUpdateSelection, Bool)? in
+        let worker = Task.detached(priority: manual ? .userInitiated : .utility) { () async throws -> (IndexedPublicCatalogSelection, Bool)? in
             try Task.checkCancellation()
             let manifestData = try await client.latestManifest()
-            let manifest = try PublicCatalogUpdateManifest.read(manifestData)
             try Task.checkCancellation()
-            guard try publicCatalogStore.shouldInstall(manifest) else { return nil }
-            let payload = try await client.payload(manifestData: manifestData)
-            try Task.checkCancellation()
-            let selected = try publicCatalogStore.install(payload)
-            return (selected, Self.reviewedBundleAllowed(in: publicCatalogStore, for: selected))
+            guard let selected = try await publicCatalogStore.installStreaming(manifestData: manifestData, client: client) else {
+                return nil
+            }
+            return (selected, Self.reviewedBundleAllowed(in: publicCatalogStore, for: selected.manifest))
         }
         do {
             let result = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
             // A returned selection has committed. Publish it even after late cancellation.
             if let (selected, bundleAllowed) = result {
-                applyPublicCatalog(selected, bundleAllowed: bundleAllowed)
+                applyIndexedPublicCatalog(selected, bundleAllowed: bundleAllowed)
                 publicCatalogUpdateStatus = "Pin data updated. Your personal pins and deliveries were preserved."
             } else { publicCatalogUpdateStatus = "Pin data is up to date. The saved copy remains available offline." }
         } catch is CancellationError {
@@ -247,17 +362,20 @@ final class AppStore: ObservableObject {
     }
     func rollbackPublicCatalog() async {
         guard publicCatalogUpdatesEnabled, !catalogRefreshPending, let publicCatalogStore else { return }
+        if let pendingIndex = backgroundIndexTask {
+            await pendingIndex.value
+        }
         catalogRefreshPending = true
         publicCatalogUpdateStatus = "Restoring the previous verified pin data…"
         defer { catalogRefreshPending = false }
         let worker = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
-            let selected = try publicCatalogStore.rollback()
-            return (selected, Self.reviewedBundleAllowed(in: publicCatalogStore, for: selected))
+            let selected = try publicCatalogStore.rollbackIndexed()
+            return (selected, Self.reviewedBundleAllowed(in: publicCatalogStore, for: selected.manifest))
         }
         do {
             let (selected, bundleAllowed) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
-            applyPublicCatalog(selected, bundleAllowed: bundleAllowed)
+            applyIndexedPublicCatalog(selected, bundleAllowed: bundleAllowed)
             publicCatalogUpdateStatus = "Previous pin data restored. Personal pins and deliveries were preserved."
         } catch {
             publicCatalogUpdateStatus = "The previous pin data could not be restored. The installed map remains available offline."
@@ -265,31 +383,39 @@ final class AppStore: ObservableObject {
     }
     // The store verifies its generation digests here without re-decoding 200+ MB GeoJSON.
     private nonisolated static func reviewedBundleAllowed(in store: PublicCatalogUpdateStore,
-                                                          for selected: PublicCatalogUpdateSelection) -> Bool {
-        store.isReviewedBundleAllowed(for: selected.manifest)
+                                                          for manifest: PublicCatalogUpdateManifest) -> Bool {
+        store.isReviewedBundleAllowed(for: manifest)
     }
-    private func applyPublicCatalog(_ selected: PublicCatalogUpdateSelection, bundleAllowed eligible: Bool) {
-        // Release old 350k+ place caches before indexing the newly installed catalog so peak RAM stays flat.
+    private func applyIndexedPublicCatalog(_ selected: IndexedPublicCatalogSelection, bundleAllowed eligible: Bool) {
         mergedPlaces.removeAll(keepingCapacity: false)
         apartmentPlacesByCommunity.removeAll(keepingCapacity: false)
+        indexedPlaceCache.removeAll(keepingCapacity: false)
+        indexedPlaceCacheOrder.removeAll(keepingCapacity: false)
+        indexedOverlayPlaces.removeAll(keepingCapacity: false)
+        indexedOverlayByCommunity.removeAll(keepingCapacity: false)
+        indexedPolicy = nil
         scopedApartmentPlaces.removeAll(keepingCapacity: false)
         cachedDoorMatches.removeAll(keepingCapacity: false)
         pack = nil
         publicOwnershipView = nil
         publicCatalogSupplement = nil
-        let baseline = reviewedBaseline
-        reviewedOverlayAllowed = eligible && reviewedOverlay != nil && baseline != nil &&
-            (selected.manifest.sequence > baseline!.manifest.sequence || selected.manifest.sequence < baseline!.manifest.sequence || selected.manifest == baseline!.manifest)
-        if eligible, let baseline, selected.manifest.sequence < baseline.manifest.sequence {
+        indexedPublicCatalog = nil
+        let baselineManifest = reviewedBaselineManifest
+        reviewedOverlayAllowed = eligible && reviewedOverlay != nil && baselineManifest != nil &&
+            (selected.manifest.sequence > baselineManifest!.sequence || selected.manifest.sequence < baselineManifest!.sequence || selected.manifest == baselineManifest!)
+        if eligible, let baselineManifest, selected.manifest.sequence < baselineManifest.sequence,
+           let baseline = try? loadReviewedBaselineIfNeeded(from: resourceBundleRef) {
             publicCatalogSupplement = baseline.pack
             publicCatalogRevisionLabel = "Bundled · \(baseline.manifest.revision)"
+            canRollbackPublicCatalog = selected.canRollback
+            pack = supplementedPack(loadedBasePack, with: baseline.pack)
         } else {
-            publicCatalogSupplement = selected.pack
+            reviewedBaseline = nil
+            indexedPublicCatalog = selected
             publicCatalogRevisionLabel = selected.manifest.revision
+            canRollbackPublicCatalog = selected.canRollback
+            pack = supplementedIndexedPack(loadedBasePack, with: selected)
         }
-        canRollbackPublicCatalog = selected.canRollback
-        // Reproject over the latest private/personal state, never a pre-download snapshot.
-        if let publicCatalogSupplement { pack = supplementedPack(loadedBasePack, with: publicCatalogSupplement) }
         if loadedBasePack == nil { packStatus = "Public map catalog loaded" }
         rebuildPlaceIndex()
         rebuildApartmentPlan()
@@ -317,8 +443,8 @@ final class AppStore: ObservableObject {
         // Activation has committed. Publish its exact selection even after a late cancellation.
         applyPrivatePack(selected)
     }
-    private func reservedPublicCommunityIDs(in backup: PersonalBackup, supplement: LocalDataPack? = nil) -> Set<String> {
-        guard let publicCatalogSupplement = supplement ?? publicOwnershipView ?? publicCatalogSupplement else { return [] }
+    private func reservedPublicCommunityIDs(in backup: PersonalBackup, catalog: Catalog? = nil) -> Set<String> {
+        guard let effectiveCatalog = catalog ?? publicOwnershipView?.catalog ?? publicCatalogSupplement?.catalog ?? indexedPublicCatalog?.catalog else { return [] }
         let owned = Set(backup.places.map(\.communityID))
             .union(backup.paths.map(\.communityID))
             .union(backup.apartmentRules.compactMap(\.communityID))
@@ -333,7 +459,7 @@ final class AppStore: ObservableObject {
         }
         if !backup.miniRouteCompletions.isEmpty {
             let stopsByID = Dictionary(backup.stops.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            let knownAddresses = publicCatalogSupplement.catalog.communities.flatMap(\.matchingAddresses) +
+            let knownAddresses = effectiveCatalog.communities.flatMap(\.matchingAddresses) +
                 backup.apartmentRules.map(\.address) + backup.places.map(\.address)
             let resolver = DeliveryAddress.Resolver(knownAddresses: knownAddresses)
             for receipt in backup.miniRouteCompletions {
@@ -347,11 +473,9 @@ final class AppStore: ObservableObject {
                 }
             }
         }
-        return Set(publicCatalogSupplement.catalog.communities.compactMap { community in
+        return Set(effectiveCatalog.communities.compactMap { community in
             guard owned.contains(community.id) else { return nil }
             let supported = Set(community.matchingAddresses.map { LocalSearch.addressKey($0) })
-            // Old paths carry no physical address. Without pin/rule/receipt
-            // evidence, keep their previously personal-only ID reserved.
             guard let evidence = addresses[community.id], !evidence.isEmpty,
                   evidence.isSubset(of: supported) else { return community.id }
             return nil
@@ -365,11 +489,47 @@ final class AppStore: ObservableObject {
         } else { publicView = supplement }
         publicOwnershipView = publicView
         return PublicCatalogSupplement.applying(publicView, to: base,
-            reservingCommunityIDs: reservedPublicCommunityIDs(in: personal, supplement: publicView))
+            reservingCommunityIDs: reservedPublicCommunityIDs(in: personal, catalog: publicView.catalog))
+    }
+    private func supplementedIndexedPack(_ base: LocalDataPack?, with indexed: IndexedPublicCatalogSelection) -> LocalDataPack {
+        let catalog: Catalog
+        let addedOverlay: [Place]
+        if reviewedOverlayAllowed, let reviewedOverlay {
+            let delta = ReviewedBundleComposition.overlayDelta(
+                reviewedOverlay,
+                against: indexed.catalog,
+                placeStore: indexed.placeStore,
+                privatePlaces: base?.places ?? [],
+                personalPlaces: personal.places
+            )
+            catalog = delta.catalog
+            addedOverlay = delta.addedPlaces
+        } else {
+            catalog = indexed.catalog
+            addedOverlay = []
+        }
+        indexedOverlayPlaces = addedOverlay
+        indexedOverlayByCommunity = Dictionary(grouping: addedOverlay, by: \.communityID)
+        indexedPlaceCache.removeAll(keepingCapacity: false)
+        indexedPlaceCacheOrder.removeAll(keepingCapacity: false)
+        let reserved = reservedPublicCommunityIDs(in: personal, catalog: catalog)
+        let (mergedPack, policy) = PublicCatalogSupplement.applyingIndexed(
+            catalog: catalog,
+            paths: indexed.paths,
+            to: base,
+            reservingCommunityIDs: reserved,
+            resolveReferencePlace: { id in indexed.placeStore.place(id: id) }
+        )
+        indexedPolicy = policy
+        return mergedPack
     }
     private func applyPrivatePack(_ selected: PrivateDataPackSelection) {
         loadedBasePack = selected.pack
-        pack = publicCatalogSupplement.map { supplementedPack(selected.pack, with: $0) } ?? selected.pack
+        if let indexed = indexedPublicCatalog {
+            pack = supplementedIndexedPack(selected.pack, with: indexed)
+        } else {
+            pack = publicCatalogSupplement.map { supplementedPack(selected.pack, with: $0) } ?? selected.pack
+        }
         packStatus = "Private map pack installed"
         rebuildPlaceIndex()
         rebuildApartmentPlan()
@@ -400,9 +560,10 @@ final class AppStore: ObservableObject {
     } }
     @discardableResult
     func save(_ path: PathSegment) -> Bool {
+        let publicCommunities = (publicOwnershipView ?? publicCatalogSupplement)?.catalog.communities ?? indexedPublicCatalog?.catalog.communities ?? []
         let publicOnlyCommunity = communities.first { community in
             community.id == path.communityID &&
-                (publicOwnershipView ?? publicCatalogSupplement)?.catalog.communities.contains(where: { $0.id == community.id }) == true &&
+                publicCommunities.contains(where: { $0.id == community.id }) &&
                 loadedBasePack?.catalog.communities.contains(where: { $0.id == community.id }) != true
         }
         return updatePersonal { records in
@@ -418,9 +579,35 @@ final class AppStore: ObservableObject {
         }
     }
     func search(address: String, unit: String, building: String = "") -> [Place] {
+        let allCommunities = communities
+        let candidates = FinderSearch.communities(matching: address, in: allCommunities)
+        let searchablePlaces: [Place]
+        if let indexed = indexedPublicCatalog, let policy = indexedPolicy {
+            var communityIDs = Set(candidates.map(\.id))
+            let parsed = DeliveryAddress.resolve(address, unit: unit, knownAddresses: knownApartmentAddresses)
+            let addrKey = LocalSearch.addressKey(parsed.address)
+            var matchedByKey: [Place] = []
+            if !addrKey.isEmpty {
+                let rawByKey = indexed.placeStore.places(matchingAddressKeys: [addrKey])
+                let filtered = PublicCatalogSupplement.filterIndexedPlaces(rawByKey, policy: policy, basePlaces: loadedBasePack?.places ?? [])
+                matchedByKey = filtered
+                for p in filtered { communityIDs.insert(p.communityID) }
+            }
+            var gathered: [Place] = []
+            var seenIDs = Set<String>()
+            // Query matched communities (capped at 40 so broad 1-letter queries never blow RAM).
+            for cid in communityIDs.prefix(40) {
+                for p in places(in: cid) where seenIDs.insert(p.id).inserted { gathered.append(p) }
+            }
+            for p in matchedByKey where seenIDs.insert(p.id).inserted { gathered.append(p) }
+            for p in personal.places where seenIDs.insert(p.id).inserted { gathered.append(p) }
+            for p in loadedBasePack?.places ?? [] where seenIDs.insert(p.id).inserted { gathered.append(p) }
+            searchablePlaces = gathered
+        } else {
+            searchablePlaces = places
+        }
         let found = FinderSearch.locations(address: address, unit: unit, building: building,
-                                           places: places, communities: communities)
-        let candidates = FinderSearch.communities(matching: address, in: communities)
+                                           places: searchablePlaces, communities: allCommunities)
         selectedCommunityID = candidates.count == 1 ? candidates.first?.id : nil
         let resultCommunities = Set(found.map(\.communityID))
         if resultCommunities.count == 1 { selectedCommunityID = resultCommunities.first }
@@ -475,8 +662,15 @@ final class AppStore: ObservableObject {
     }
     private func rebuildPlaceIndex() {
         DeliveryPerformance.measure("Rebuild pin index") {
-            mergedPlaces = LocalSearch.merged(seed: pack?.places ?? [], overrides: personal.places)
-            apartmentPlacesByCommunity = Dictionary(grouping: mergedPlaces, by: \.communityID)
+            if indexedPublicCatalog != nil {
+                mergedPlaces.removeAll(keepingCapacity: false)
+                apartmentPlacesByCommunity.removeAll(keepingCapacity: false)
+                indexedPlaceCache.removeAll(keepingCapacity: false)
+                indexedPlaceCacheOrder.removeAll(keepingCapacity: false)
+            } else {
+                mergedPlaces = LocalSearch.merged(seed: pack?.places ?? [], overrides: personal.places)
+                apartmentPlacesByCommunity = Dictionary(grouping: mergedPlaces, by: \.communityID)
+            }
             buildingAssociationsByCommunity = Dictionary(grouping: pack?.catalog.unitBuildingAssociations ?? [], by: \.communityID)
             floorReferencesByCommunity = Dictionary(grouping: pack?.catalog.unitFloorReferences ?? [], by: \.communityID)
             scopedApartmentPlaces.removeAll(); scopedBuildingAssociations.removeAll()
@@ -500,9 +694,14 @@ final class AppStore: ObservableObject {
     }
     private func refreshPersonal(from previous: PersonalBackup) {
         let communityOwnershipChanged = reservedPublicCommunityIDs(in: previous) != reservedPublicCommunityIDs(in: personal)
-        if (communityOwnershipChanged || previous.places != personal.places), let publicCatalogSupplement {
-            pack = supplementedPack(loadedBasePack, with: publicCatalogSupplement)
-            if communityOwnershipChanged { packRevision &+= 1 }
+        if (communityOwnershipChanged || previous.places != personal.places) {
+            if let indexed = indexedPublicCatalog {
+                pack = supplementedIndexedPack(loadedBasePack, with: indexed)
+                if communityOwnershipChanged { packRevision &+= 1 }
+            } else if let publicCatalogSupplement {
+                pack = supplementedPack(loadedBasePack, with: publicCatalogSupplement)
+                if communityOwnershipChanged { packRevision &+= 1 }
+            }
         }
         let placesChanged = previous.places != personal.places
         if placesChanged || communityOwnershipChanged { rebuildPlaceIndex() }
@@ -536,9 +735,22 @@ final class AppStore: ObservableObject {
     }
     private func scopedPlaces(for groupID: String) -> [Place] {
         if let existing = scopedApartmentPlaces[groupID] { return existing }
-        let places = apartmentGroup(groupID)?.scopedPlaces(in: apartmentPlacesByCommunity) ?? apartmentPlacesByCommunity[groupID] ?? []
-        scopedApartmentPlaces[groupID] = places
-        return places
+        let resolved: [Place]
+        if indexedPublicCatalog != nil {
+            if let group = apartmentGroup(groupID) {
+                var slice: [String: [Place]] = [:]
+                for cid in Set([group.id, group.legacyCommunityID, group.directoryCommunityID].compactMap { $0 }) {
+                    slice[cid] = places(in: cid)
+                }
+                resolved = group.scopedPlaces(in: slice)
+            } else {
+                resolved = places(in: groupID)
+            }
+        } else {
+            resolved = apartmentGroup(groupID)?.scopedPlaces(in: apartmentPlacesByCommunity) ?? apartmentPlacesByCommunity[groupID] ?? []
+        }
+        scopedApartmentPlaces[groupID] = resolved
+        return resolved
     }
     func doorMatch(_ stop: DeliveryStop, groupID: String) -> ApartmentDoorMatch {
         var identity = stop; identity.completed = false

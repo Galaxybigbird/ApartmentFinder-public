@@ -135,6 +135,24 @@ public struct PublicCatalogUpdateSelection: Sendable {
     public let canRollback: Bool
 }
 
+public struct IndexedPublicCatalogSelection: Sendable {
+    public let catalog: Catalog
+    public let paths: [PathSegment]
+    public let placeStore: PublicPlaceStore
+    public let manifest: PublicCatalogUpdateManifest
+    public let recoveredPrevious: Bool
+    public let canRollback: Bool
+    public init(catalog: Catalog, paths: [PathSegment], placeStore: PublicPlaceStore,
+                manifest: PublicCatalogUpdateManifest, recoveredPrevious: Bool, canRollback: Bool) {
+        self.catalog = catalog
+        self.paths = paths
+        self.placeStore = placeStore
+        self.manifest = manifest
+        self.recoveredPrevious = recoveredPrevious
+        self.canRollback = canRollback
+    }
+}
+
 enum PublicCatalogUpdateIntegrity {
     static func isDigest(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
@@ -185,14 +203,112 @@ enum PublicCatalogGzip {
     }
 
     static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFF_FFFF
         data.withUnsafeBytes { raw in
-            for byte in raw {
-                let idx = Int((crc ^ UInt32(byte)) & 0xFF)
-                crc = crcTable[idx] ^ (crc >> 8)
-            }
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return updateCRC32(0xFFFF_FFFF, bytes: base, count: raw.count) ^ 0xFFFF_FFFF
         }
-        return crc ^ 0xFFFF_FFFF
+    }
+
+    static func updateCRC32(_ initial: UInt32, bytes: UnsafePointer<UInt8>, count: Int) -> UInt32 {
+        var crc = initial
+        for i in 0..<count {
+            let idx = Int((crc ^ UInt32(bytes[i])) & 0xFF)
+            crc = crcTable[idx] ^ (crc >> 8)
+        }
+        return crc
+    }
+
+    /// Streams gzip decompression directly to disk in 64 KB chunks while validating
+    /// exact byte count, trailer isize, CRC32, and SHA-256 without holding 200+ MB in RAM.
+    static func decompress(_ compressed: Data, to outputURL: URL, expectedBytes: Int, maximumBytes: Int) throws -> (bytes: Int, sha256: String) {
+        guard expectedBytes >= 1, expectedBytes <= maximumBytes, compressed.count >= 18 else {
+            throw CoreError("Invalid gzip public catalog payload.")
+        }
+        #if canImport(Compression) && canImport(CryptoKit)
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        #if os(iOS)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: outputURL.path
+        )
+        #endif
+        var succeeded = false
+        defer { if !succeeded { try? FileManager.default.removeItem(at: outputURL) } }
+        let handle = try FileHandle(forWritingTo: outputURL)
+        defer { try? handle.close() }
+
+        var totalWritten = 0
+        var runningCRC: UInt32 = 0xFFFF_FFFF
+        var hasher = SHA256()
+
+        let expectedCRC: UInt32 = try compressed.withUnsafeBytes { rawInput in
+            let bytes = rawInput.bindMemory(to: UInt8.self)
+            guard let base = bytes.baseAddress else { throw CoreError("Invalid gzip buffer.") }
+            let payloadStart = try parseHeaderEnd(bytes)
+            let trailerStart = bytes.count - 8
+            let crc = uint32LE(bytes, at: trailerStart)
+            let isize = uint32LE(bytes, at: trailerStart + 4)
+            guard isize == UInt32(truncatingIfNeeded: expectedBytes) else {
+                throw CoreError("Gzip trailer size does not match manifest.")
+            }
+
+            let streamPtr = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+            defer { streamPtr.deallocate() }
+            let initStatus = compression_stream_init(streamPtr, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
+            guard initStatus != COMPRESSION_STATUS_ERROR else {
+                throw CoreError("Unable to initialize gzip decompression.")
+            }
+            defer { compression_stream_destroy(streamPtr) }
+
+            let chunkSize = 65_536
+            let dstBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+            defer { dstBuf.deallocate() }
+
+            streamPtr.pointee.src_ptr = base.advanced(by: payloadStart)
+            streamPtr.pointee.src_size = trailerStart - payloadStart
+            let finalize = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
+
+            while true {
+                streamPtr.pointee.dst_ptr = dstBuf
+                streamPtr.pointee.dst_size = chunkSize
+                let status = compression_stream_process(streamPtr, finalize)
+                let produced = chunkSize - streamPtr.pointee.dst_size
+                if produced > 0 {
+                    guard produced <= expectedBytes - totalWritten else {
+                        throw CoreError("Compressed public catalog exceeded its declared byte budget.")
+                    }
+                    runningCRC = updateCRC32(runningCRC, bytes: dstBuf, count: produced)
+                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: dstBuf, count: produced))
+                    try handle.write(contentsOf: Data(bytesNoCopy: dstBuf, count: produced, deallocator: .none))
+                    totalWritten += produced
+                }
+                if status == COMPRESSION_STATUS_END {
+                    break
+                } else if status != COMPRESSION_STATUS_OK || (produced == 0 && streamPtr.pointee.src_size == 0) {
+                    throw CoreError("Compressed public catalog is corrupt or truncated.")
+                }
+            }
+            guard streamPtr.pointee.src_size == 0 else {
+                throw CoreError("Trailing bytes after gzip public catalog payload.")
+            }
+            return crc
+        }
+        guard totalWritten == expectedBytes else {
+            throw CoreError("Decompressed public catalog length does not match its manifest.")
+        }
+        guard (runningCRC ^ 0xFFFF_FFFF) == expectedCRC else {
+            throw CoreError("Decompressed public catalog CRC32 mismatch.")
+        }
+        try handle.synchronize()
+        succeeded = true
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return (totalWritten, digest)
+        #else
+        let raw = try decompress(compressed, expectedBytes: expectedBytes, maximumBytes: maximumBytes)
+        try raw.write(to: outputURL, options: .atomic)
+        let digest = try PublicCatalogUpdateIntegrity.digest(raw)
+        return (raw.count, digest)
+        #endif
     }
 
     private static func uint32LE(_ bytes: UnsafeBufferPointer<UInt8>, at offset: Int) -> UInt32 {

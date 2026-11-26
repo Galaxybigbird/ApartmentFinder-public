@@ -4,20 +4,22 @@ public struct LocalDataPack: Sendable {
     public var catalog: Catalog
     public var places: [Place]
     public var paths: [PathSegment]
-    public static func read(catalog: Data, locations: Data, paths: Data) throws -> LocalDataPack {
-        let decoder = JSONDecoder()
-        var catalog = try decoder.decode(Catalog.self, from: catalog)
-        let lines = try decoder.decode(FeatureCollection<LineFeature>.self, from: paths)
-        guard catalog.schemaVersion == 1, lines.schemaVersion == 1,
-              lines.type == "FeatureCollection",
-              lines.packVersion == catalog.packVersion else {
+
+    struct ValidatedCatalogMetadata {
+        let communityIDs: Set<String>
+        let sourceIDs: Set<String>
+        let addressesByCommunity: [String: Set<String>]
+        let neededRefIDs: Set<String>
+    }
+
+    static func validateCatalogMetadata(_ catalog: Catalog) throws -> ValidatedCatalogMetadata {
+        guard catalog.schemaVersion == 1 else {
             throw CoreError("The local data pack is unsupported or contains mismatched versions.")
         }
         let communityIDs = Set(catalog.communities.map(\.id)), sourceIDs = Set(catalog.sources.map(\.id))
         let scopeZIPs = Set(catalog.scopeZIPs)
         let supportedZIPs = DeliveryAreaScope.supportedZIPs
         guard communityIDs.count == catalog.communities.count, sourceIDs.count == catalog.sources.count,
-              Set(lines.features.map(\.id)).count == lines.features.count,
               !scopeZIPs.isEmpty, scopeZIPs.count == catalog.scopeZIPs.count,
               scopeZIPs.isSubset(of: supportedZIPs) else { throw CoreError("Invalid or duplicate data-pack identifiers.") }
         let exceptions = catalog.deliveryAreaExceptions ?? []
@@ -39,11 +41,6 @@ public struct LocalDataPack: Sendable {
                 throw CoreError("Unsupported delivery-area exception.")
             }
         }
-        func validate(_ community: String, _ sources: [String]) throws {
-            guard communityIDs.contains(community), !sources.isEmpty, sources.allSatisfy(sourceIDs.contains) else {
-                throw CoreError("A mapped location has no traceable community or source.")
-            }
-        }
         for community in catalog.communities {
             let countyZIPs = community.countyZIPs ?? []
             guard Set(countyZIPs).count == countyZIPs.count, countyZIPs.allSatisfy(catalog.scopeZIPs.contains) else {
@@ -53,7 +50,9 @@ public struct LocalDataPack: Sendable {
                     exceptions.contains(where: { $0.communityID == community.id && $0.address == community.address && $0.postalZIP == community.zip }) else {
                 throw CoreError("Community outside the requested delivery area.")
             }
-            try validate(community.id, community.sourceIDs)
+            guard communityIDs.contains(community.id), !community.sourceIDs.isEmpty, community.sourceIDs.allSatisfy(sourceIDs.contains) else {
+                throw CoreError("A mapped location has no traceable community or source.")
+            }
             if let locker = community.digitalLocker, !locker.isValid(sourceIDs: sourceIDs) {
                 throw CoreError("Invalid electronic package locker evidence or separately sourced location.")
             }
@@ -62,75 +61,108 @@ public struct LocalDataPack: Sendable {
         for source in catalog.sources {
             guard let url = URL(string: source.url), ["https", "http"].contains(url.scheme ?? ""), url.host != nil else { throw CoreError("Invalid source URL.") }
         }
+        let addressesByCommunity = Dictionary(uniqueKeysWithValues: catalog.communities.map {
+            ($0.id, Set($0.matchingAddresses.map { LocalSearch.addressKey($0) }))
+        })
+        let associations = catalog.unitBuildingAssociations ?? []
+        guard associations.count <= 50_000, Set(associations.map(\.id)).count == associations.count else {
+            throw CoreError("Invalid or duplicate building associations.")
+        }
+        let neededRefIDs = Set(associations.compactMap(\.referencePlaceID))
+        return ValidatedCatalogMetadata(communityIDs: communityIDs, sourceIDs: sourceIDs,
+                                        addressesByCommunity: addressesByCommunity, neededRefIDs: neededRefIDs)
+    }
+
+    static func decodePointFeature(_ data: Data, decoder: JSONDecoder = JSONDecoder()) throws -> Place {
+        let feature = try decoder.decode(PointFeature.self, from: data)
+        guard feature.type == "Feature", feature.geometry.type == "Point", !feature.id.isEmpty else {
+            throw CoreError("Invalid point feature.")
+        }
+        guard feature.geometry.coordinates.count == 2 else {
+            throw CoreError("Expected a longitude/latitude pair.")
+        }
+        let coord = Coordinate(latitude: feature.geometry.coordinates[1], longitude: feature.geometry.coordinates[0])
+        guard coord.isValid else { throw CoreError("Invalid map coordinates.") }
+        let p = feature.properties
+        return Place(
+            id: feature.id, communityID: p.communityID, address: p.address, building: p.building,
+            unit: p.unit, floor: p.floor, kind: p.kind, verification: p.verification,
+            coordinate: coord, sourceIDs: p.sourceIDs, notes: p.notes,
+            approachID: p.approachID, graphNodeID: p.graphNodeID,
+            identityUncertain: p.identityUncertain, referenceKind: p.referenceKind,
+            estimatedHorizontalUncertaintyM: p.estimatedHorizontalUncertaintyM,
+            mapLabelOccurrenceID: p.mapLabelOccurrenceID, sourceUnitID: p.sourceUnitID,
+            referenceAddresses: p.referenceAddresses, entranceSideEstimate: p.entranceSideEstimate
+        )
+    }
+
+    static func validatePlace(_ place: Place, metadata: ValidatedCatalogMetadata) throws {
+        guard metadata.communityIDs.contains(place.communityID), !place.sourceIDs.isEmpty,
+              place.sourceIDs.allSatisfy(metadata.sourceIDs.contains) else {
+            throw CoreError("A mapped location has no traceable community or source.")
+        }
+        if place.entranceSideEstimate != nil, !place.isValidEntranceSideEstimate {
+            throw CoreError("An estimated entrance-side area must retain unverified status, qualified floor evidence and an uncalibrated working search region.")
+        }
+        if place.referenceKind != nil, !place.isValidBuildingAreaReference {
+            throw CoreError("A building reference must retain its source type and bounded area precision, without representing a unit, entrance or door.")
+        }
+        if place.referenceKind != .operatorMapBuildingArea, place.estimatedHorizontalUncertaintyM != nil || place.mapLabelOccurrenceID != nil {
+            throw CoreError("Operator area metadata requires an operator building-area reference.")
+        }
+        if let aliases = place.referenceAddresses {
+            let keys = aliases.map { LocalSearch.addressKey($0) }
+            let allowed = metadata.addressesByCommunity[place.communityID] ?? []
+            guard place.isValidBuildingAreaReference, !keys.isEmpty, keys.count <= 8, Set(keys).count == keys.count,
+                  !keys.contains(""), Set(keys).isSubset(of: allowed) else { throw CoreError("Building reference street aliases require explicit community streets.") }
+        }
+        if place.sourceUnitID != nil, place.kind != .unitPosition || place.verification != .sourceMapped || place.sourceUnitID?.isEmpty == true {
+            throw CoreError("A source unit identifier requires a published unit position.")
+        }
+    }
+
+    static func readPaths(_ data: Data, catalog: Catalog, metadata: ValidatedCatalogMetadata) throws -> [PathSegment] {
+        let lines = try JSONDecoder().decode(FeatureCollection<LineFeature>.self, from: data)
+        guard lines.schemaVersion == 1, lines.type == "FeatureCollection",
+              lines.packVersion == catalog.packVersion else {
+            throw CoreError("The local data pack is unsupported or contains mismatched versions.")
+        }
+        guard Set(lines.features.map(\.id)).count == lines.features.count else {
+            throw CoreError("Invalid or duplicate data-pack identifiers.")
+        }
         func coordinate(_ numbers: [Double]) throws -> Coordinate {
             guard numbers.count == 2 else { throw CoreError("Expected a longitude/latitude pair.") }
             let value = Coordinate(latitude: numbers[1], longitude: numbers[0])
             guard value.isValid else { throw CoreError("Invalid map coordinates.") }
             return value
         }
-        let communitiesByID = Dictionary(uniqueKeysWithValues: catalog.communities.map { ($0.id, $0) })
-        let addressesByCommunity = communitiesByID.mapValues { Set($0.matchingAddresses.map { LocalSearch.addressKey($0) }) }
-        // Stream PointFeature -> Place directly so [PointFeature] and [Place] are never held in memory simultaneously.
-        let streamedPoints: StreamedPointCollection = try withAutoreleasePool {
-            try decoder.decode(StreamedPointCollection.self, from: locations)
-        }
-        guard streamedPoints.schemaVersion == 1, streamedPoints.type == "FeatureCollection",
-              streamedPoints.packVersion == catalog.packVersion else {
-            throw CoreError("The local data pack is unsupported or contains mismatched versions.")
-        }
-        var places = streamedPoints.places
-        for place in places {
-            try validate(place.communityID, place.sourceIDs)
-            if place.entranceSideEstimate != nil, !place.isValidEntranceSideEstimate {
-                throw CoreError("An estimated entrance-side area must retain unverified status, qualified floor evidence and an uncalibrated working search region.")
-            }
-            if place.referenceKind != nil, !place.isValidBuildingAreaReference {
-                throw CoreError("A building reference must retain its source type and bounded area precision, without representing a unit, entrance or door.")
-            }
-            if place.referenceKind != .operatorMapBuildingArea, place.estimatedHorizontalUncertaintyM != nil || place.mapLabelOccurrenceID != nil {
-                throw CoreError("Operator area metadata requires an operator building-area reference.")
-            }
-            if let aliases = place.referenceAddresses {
-                let keys = aliases.map { LocalSearch.addressKey($0) }
-                let allowed = addressesByCommunity[place.communityID] ?? []
-                guard place.isValidBuildingAreaReference, !keys.isEmpty, keys.count <= 8, Set(keys).count == keys.count,
-                      !keys.contains(""), Set(keys).isSubset(of: allowed) else { throw CoreError("Building reference street aliases require explicit community streets.") }
-            }
-            if place.sourceUnitID != nil, place.kind != .unitPosition || place.verification != .sourceMapped || place.sourceUnitID?.isEmpty == true {
-                throw CoreError("A source unit identifier requires a published unit position.")
-            }
-        }
-        let segments: [PathSegment] = try lines.features.map { feature in
+        return try lines.features.map { feature in
             let p = feature.properties
             guard feature.type == "Feature", feature.geometry.type == "LineString", !feature.id.isEmpty,
                   !p.fromNode.isEmpty, !p.toNode.isEmpty, feature.geometry.coordinates.count >= 2 else { throw CoreError("Invalid path feature.") }
-            try validate(p.communityID, p.sourceIDs)
+            guard metadata.communityIDs.contains(p.communityID), !p.sourceIDs.isEmpty, p.sourceIDs.allSatisfy(metadata.sourceIDs.contains) else {
+                throw CoreError("A mapped location has no traceable community or source.")
+            }
             return PathSegment(id: feature.id, communityID: p.communityID, fromNode: p.fromNode, toNode: p.toNode,
                                coordinates: try feature.geometry.coordinates.map(coordinate), mode: p.mode,
                                oneWay: p.oneWay, blocked: p.blocked, stairs: p.stairs, confirmed: p.confirmed,
                                sourceIDs: p.sourceIDs, notes: p.notes)
         }
+    }
+
+    static func validateAssociationsAndFloors(catalog: Catalog, placesByID: [String: Place], metadata: ValidatedCatalogMetadata) throws {
         let associations = catalog.unitBuildingAssociations ?? []
-        guard associations.count <= 50_000, Set(associations.map(\.id)).count == associations.count else {
-            throw CoreError("Invalid or duplicate building associations.")
-        }
         var associationKeys = Set<String>()
-        let neededRefIDs = Set(associations.compactMap(\.referencePlaceID))
-        var placesByID: [String: Place] = [:]
-        if !neededRefIDs.isEmpty {
-            placesByID.reserveCapacity(neededRefIDs.count)
-            for place in places where neededRefIDs.contains(place.id) {
-                placesByID[place.id] = place
-            }
-        }
         for a in associations {
-            try validate(a.communityID, a.sourceIDs)
+            guard metadata.communityIDs.contains(a.communityID), !a.sourceIDs.isEmpty, a.sourceIDs.allSatisfy(metadata.sourceIDs.contains) else {
+                throw CoreError("A mapped location has no traceable community or source.")
+            }
             let addressKey = LocalSearch.addressKey(a.address)
             let key = [a.communityID, addressKey, LocalSearch.normalized(a.unit), a.identifierKind.rawValue].joined(separator: "|")
             guard !a.id.isEmpty, !a.unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !a.building.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   associationKeys.insert(key).inserted,
-                  addressesByCommunity[a.communityID]?.contains(addressKey) == true else { throw CoreError("A building association has an ambiguous unit or street.") }
+                  metadata.addressesByCommunity[a.communityID]?.contains(addressKey) == true else { throw CoreError("A building association has an ambiguous unit or street.") }
             if let floor = a.mapFloor {
                 guard a.identifierKind == .operatorMap, !floor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw CoreError("Only an explicit operator schematic can supply a map floor label.")
@@ -158,65 +190,50 @@ public struct LocalDataPack: Sendable {
         }
         var floorKeys = Set<String>()
         for reference in floorReferences {
-            try validate(reference.communityID, reference.sourceIDs)
+            guard metadata.communityIDs.contains(reference.communityID), !reference.sourceIDs.isEmpty, reference.sourceIDs.allSatisfy(metadata.sourceIDs.contains) else {
+                throw CoreError("A mapped location has no traceable community or source.")
+            }
             let address = LocalSearch.addressKey(reference.address)
             let key = [reference.communityID, address, LocalSearch.normalized(reference.unit)].joined(separator: "|")
             guard !reference.id.isEmpty, !reference.unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !reference.floor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  addressesByCommunity[reference.communityID]?.contains(address) == true,
+                  metadata.addressesByCommunity[reference.communityID]?.contains(address) == true,
                   floorKeys.insert(key).inserted else { throw CoreError("A floor-only reference has ambiguous identity.") }
         }
-        try RileyPropertySeparation.apply(to: &catalog, places: &places)
-        return LocalDataPack(catalog: catalog, places: places, paths: segments)
     }
-}
 
-private struct StreamedPointCollection: Decodable {
-    var type: String
-    var schemaVersion: Int
-    var packVersion: String
-    var places: [Place]
+    static func requiresRileySeparation(_ catalog: Catalog) -> Bool {
+        let isPublicVersion = ["2026.10.19.1-public", "2026.10.19.2-public", "2026.10.20.1-public", "2026.10.20.2-public", "2026.10.20.3-public"].contains(catalog.packVersion)
+        return (catalog.packVersion == "2026.10.14.1" || isPublicVersion) &&
+            catalog.communities.contains(where: { $0.id == "alcove" && $0.address == "6355 S Riley St" })
+    }
 
-    private enum CodingKeys: String, CodingKey { case type, schemaVersion, packVersion, features }
+    public static func read(catalog: Data, locations: Data, paths: Data) throws -> LocalDataPack {
+        let decoder = JSONDecoder()
+        var catalog = try decoder.decode(Catalog.self, from: catalog)
+        let metadata = try validateCatalogMetadata(catalog)
+        let segments = try readPaths(paths, catalog: catalog, metadata: metadata)
 
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        type = try container.decode(String.self, forKey: .type)
-        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
-        packVersion = try container.decode(String.self, forKey: .packVersion)
-        var array = try container.nestedUnkeyedContainer(forKey: .features)
-        var built: [Place] = []
+        var places: [Place] = []
         var seenIDs = Set<String>()
-        if let count = array.count {
-            built.reserveCapacity(count)
-            seenIDs.reserveCapacity(count)
-        }
-        while !array.isAtEnd {
-            let feature = try array.decode(PointFeature.self)
-            guard feature.type == "Feature", feature.geometry.type == "Point", !feature.id.isEmpty else {
-                throw CoreError("Invalid point feature.")
-            }
-            guard seenIDs.insert(feature.id).inserted else {
+        var placesByID: [String: Place] = [:]
+        if !metadata.neededRefIDs.isEmpty { placesByID.reserveCapacity(metadata.neededRefIDs.count) }
+        let header = try StreamingGeoJSON.scan(data: locations) { featureData in
+            let place = try decodePointFeature(featureData, decoder: decoder)
+            guard seenIDs.insert(place.id).inserted else {
                 throw CoreError("Invalid or duplicate data-pack identifiers.")
             }
-            guard feature.geometry.coordinates.count == 2 else {
-                throw CoreError("Expected a longitude/latitude pair.")
-            }
-            let coord = Coordinate(latitude: feature.geometry.coordinates[1], longitude: feature.geometry.coordinates[0])
-            guard coord.isValid else { throw CoreError("Invalid map coordinates.") }
-            let p = feature.properties
-            built.append(Place(
-                id: feature.id, communityID: p.communityID, address: p.address, building: p.building,
-                unit: p.unit, floor: p.floor, kind: p.kind, verification: p.verification,
-                coordinate: coord, sourceIDs: p.sourceIDs, notes: p.notes,
-                approachID: p.approachID, graphNodeID: p.graphNodeID,
-                identityUncertain: p.identityUncertain, referenceKind: p.referenceKind,
-                estimatedHorizontalUncertaintyM: p.estimatedHorizontalUncertaintyM,
-                mapLabelOccurrenceID: p.mapLabelOccurrenceID, sourceUnitID: p.sourceUnitID,
-                referenceAddresses: p.referenceAddresses, entranceSideEstimate: p.entranceSideEstimate
-            ))
+            try validatePlace(place, metadata: metadata)
+            if metadata.neededRefIDs.contains(place.id) { placesByID[place.id] = place }
+            places.append(place)
         }
-        places = built
+        guard header.schemaVersion == 1, header.type == "FeatureCollection",
+              header.packVersion == catalog.packVersion else {
+            throw CoreError("The local data pack is unsupported or contains mismatched versions.")
+        }
+        try validateAssociationsAndFloors(catalog: catalog, placesByID: placesByID, metadata: metadata)
+        try RileyPropertySeparation.apply(to: &catalog, places: &places)
+        return LocalDataPack(catalog: catalog, places: places, paths: segments)
     }
 }
 

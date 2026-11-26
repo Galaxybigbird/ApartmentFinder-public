@@ -1,5 +1,8 @@
 import XCTest
 @testable import ApartmentCore
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -360,7 +363,86 @@ final class PublicCatalogUpdateTests: XCTestCase {
             _ = try await tamperedClient.payload(manifestData: v3Header)
             XCTFail("Tampered compressed payload accepted")
         } catch { }
+
+        // Also verify zero-OOM streaming install + SQLite indexed reads + rollback.
+        let streamStore = PublicCatalogUpdateStore(directory: temporary.appendingPathComponent("public-stream", isDirectory: true))
+        let streamedOpt = try await streamStore.installStreaming(manifestData: v3Header, client: client)
+        let streamed = try XCTUnwrap(streamedOpt)
+        XCTAssertEqual(streamed.manifest.revision, "revision-v3")
+        XCTAssertEqual(streamed.placeStore.totalCount, 1)
+        XCTAssertEqual(streamed.placeStore.unitPositionCount, 1)
+        XCTAssertEqual(streamed.placeStore.communityCounts["fictional"], 1)
+        XCTAssertEqual(streamed.placeStore.places(in: "fictional").first?.id, "fictional-point")
+        XCTAssertEqual(streamed.placeStore.place(id: "fictional-point")?.unit, "001")
+        XCTAssertEqual(streamed.placeStore.places(matchingAddressKeys: ["100 fictional rd"]).count, 1)
+        let duplicateStream = try await streamStore.installStreaming(manifestData: v3Header, client: client)
+        XCTAssertNil(duplicateStream)
+        let reopened = try XCTUnwrap(streamStore.loadIndexed())
+        XCTAssertEqual(reopened.manifest.sequence, 3)
+        XCTAssertEqual(reopened.placeStore.places(in: "fictional").count, 1)
         #endif
+    }
+
+    func testLiveWave36StreamingInstallAndPeakRSS() async throws {
+        guard ProcessInfo.processInfo.environment["RUN_LIVE_WAVE36_BENCH"] == "1" else {
+            throw XCTSkip("Live Wave 36 streaming benchmark only runs when RUN_LIVE_WAVE36_BENCH=1")
+        }
+        func jetsamFootprintMB() -> (current: Double, peak: Double) {
+            #if canImport(Darwin)
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let kr = withUnsafeMutablePointer(to: &info) { ptr in
+                ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+                }
+            }
+            if kr == KERN_SUCCESS {
+                return (Double(info.phys_footprint) / 1_048_576.0, Double(info.ledger_phys_footprint_peak) / 1_048_576.0)
+            }
+            #endif
+            return (0, 0)
+        }
+        let streamStore = PublicCatalogUpdateStore(directory: temporary.appendingPathComponent("live-wave36", isDirectory: true))
+        let client = PublicCatalogUpdateClient()
+        let t0 = Date()
+        let manifestData = try await client.latestManifest()
+        let manifest = try PublicCatalogUpdateManifest.read(manifestData)
+        print("LIVE MANIFEST rev=\(manifest.revision) seq=\(manifest.sequence) locBytes=\(manifest.files["public-locations.geojson"]?.bytes ?? 0)")
+
+        let t1 = Date()
+        let installedOpt = try await streamStore.installStreaming(manifestData: manifestData, client: client)
+        let installed = try XCTUnwrap(installedOpt)
+        let fpInstall = jetsamFootprintMB()
+        print(String(format: "installStreaming OK in %.2fs | communities=%d totalPlaces=%d unitPositions=%d | phys_footprint=%.1f MB peak=%.1f MB",
+                     Date().timeIntervalSince(t1), installed.catalog.communities.count,
+                     installed.placeStore.totalCount, installed.placeStore.unitPositionCount,
+                     fpInstall.current, fpInstall.peak))
+        XCTAssertGreaterThanOrEqual(installed.catalog.communities.count, 2_400)
+        XCTAssertGreaterThanOrEqual(installed.placeStore.totalCount, 350_000)
+
+        let t2 = Date()
+        let reopened = try streamStore.reviewedBundleIndexedSelection(buildLargeIndexInline: false)
+        let fpReopen = jetsamFootprintMB()
+        print(String(format: "Cold reopen OK in %.2fs | bundleAllowed=%@ | phys_footprint=%.1f MB peak=%.1f MB",
+                     Date().timeIntervalSince(t2), String(reopened.bundleAllowed), fpReopen.current, fpReopen.peak))
+        XCTAssertFalse(reopened.needsBackgroundIndex)
+        let sel = try XCTUnwrap(reopened.selection)
+
+        for cid in ["rome-park-villas", "latigo", "lyric", "the-myles", "sportsmans-manor"] {
+            let pins = sel.placeStore.places(in: cid)
+            print("  query \(cid): \(pins.count) pins (sample unit=\(pins.first?.unit ?? "-"))")
+            XCTAssertFalse(pins.isEmpty, "Missing pins for \(cid)")
+        }
+
+        let resolver = DeliveryAddress.Resolver(knownAddresses: sel.catalog.communities.flatMap(\.matchingAddresses))
+        let resolved = resolver.resolve("4425 W ROME BLVD 111 NORTH LAS VEGAS, NV 89084", unit: "")
+        XCTAssertEqual(LocalSearch.addressKey(resolved.address), "4425 w rome blvd")
+        XCTAssertEqual(resolved.unit, "111")
+        XCTAssertFalse(resolved.hasConflictingUnit)
+        let fpEnd = jetsamFootprintMB()
+        print(String(format: "ALL LIVE WAVE 36 CHECKS PASSED in %.2fs | final phys_footprint=%.1f MB peak=%.1f MB",
+                     Date().timeIntervalSince(t0), fpEnd.current, fpEnd.peak))
+        XCTAssertLessThan(fpEnd.peak, 250.0, "Peak Jetsam physical footprint must remain well below iOS OOM threshold")
     }
 }
 

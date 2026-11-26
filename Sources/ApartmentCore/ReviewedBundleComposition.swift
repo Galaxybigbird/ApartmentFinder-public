@@ -85,4 +85,19 @@ public enum ReviewedBundleComposition {
         }
         return result
     }
+
+    /// SQLite-backed counterpart to `applying(_:to:privatePlaces:personalPlaces:)`.
+    /// Queries only the overlay's small subset of communities instead of copying 355k+ places in RAM.
+    public static func overlayDelta(_ overlay: LocalDataPack, against catalog: Catalog,
+                                    placeStore: PublicPlaceStore,
+                                    privatePlaces: [Place] = [], personalPlaces: [Place] = []) -> (catalog: Catalog, addedPlaces: [Place]) {
+        let overlayCommunityIDs = Set(overlay.catalog.communities.map(\.id))
+            .union(overlay.places.map(\.communityID))
+        let scopedExisting = placeStore.places(in: overlayCommunityIDs)
+        let scopedPack = LocalDataPack(catalog: catalog, places: scopedExisting, paths: [])
+        let merged = applying(overlay, to: scopedPack, privatePlaces: privatePlaces, personalPlaces: personalPlaces)
+        let existingIDs = Set(scopedExisting.map(\.id))
+        let added = merged.places.filter { !existingIDs.contains($0.id) }
+        return (merged.catalog, added)
+    }
 }

@@ -210,6 +210,103 @@ public enum PublicCatalogSupplement {
         return result
     }
 
+    /// Lightweight metadata-only supplement for SQLite-indexed public catalogs.
+    /// Merges communities, associations, floor references, paths, and sources without
+    /// duplicating 355k+ places into Swift memory; returns the admission policy for lazy per-community reads.
+    public struct IndexedPolicy: Sendable {
+        public let admittedAddressKeys: [String: Set<String>]
+        public let usableSourceIDs: Set<String>
+    }
+
+    public static func applyingIndexed(catalog: Catalog, paths: [PathSegment], to base: LocalDataPack?,
+                                       reservingCommunityIDs: Set<String> = [],
+                                       resolveReferencePlace: (String) -> Place? = { _ in nil }) -> (pack: LocalDataPack, policy: IndexedPolicy) {
+        let emptyPlacesPack = LocalDataPack(catalog: catalog, places: [], paths: paths)
+        var result = applying(emptyPlacesPack, to: base, reservingCommunityIDs: reservingCommunityIDs)
+        // Recompute the exact per-community street admission table + usable source IDs so lazy
+        // SQLite place reads enforce the exact same admission rules as `applying(_:to:)`.
+        let baseSources = Dictionary((base?.catalog.sources ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let publicSources = Dictionary(catalog.sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let conflictingSources = Set(catalog.sources.compactMap { source in
+            guard let existing = baseSources[source.id], existing != source else { return nil }
+            return source.id
+        })
+        let usableSourceIDs = Set(publicSources.keys).subtracting(conflictingSources)
+
+        let baseCommunities = Dictionary((base?.catalog.communities ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var addressOwners: [String: Set<String>] = [:]
+        for community in (base?.catalog.communities ?? []) + catalog.communities {
+            for address in community.matchingAddresses {
+                addressOwners[LocalSearch.addressKey(address), default: []].insert(community.id)
+            }
+        }
+        var admittedAddressKeys: [String: Set<String>] = [:]
+        for community in result.catalog.communities {
+            if let pub = catalog.communities.first(where: { $0.id == community.id }) {
+                let key = LocalSearch.addressKey(pub.address)
+                guard !key.isEmpty, addressOwners[key]?.count == 1,
+                      !pub.sourceIDs.isEmpty, pub.sourceIDs.allSatisfy(usableSourceIDs.contains) else { continue }
+                if baseCommunities[pub.id] == nil, reservingCommunityIDs.contains(pub.id) { continue }
+                admittedAddressKeys[community.id] = Set(community.matchingAddresses.map { LocalSearch.addressKey($0) })
+            }
+        }
+        // Preserve any sources needed by lazy public places (since emptyPlacesPack had 0 places).
+        let existingSourceIDs = Set(result.catalog.sources.map(\.id))
+        for source in catalog.sources where usableSourceIDs.contains(source.id) && !existingSourceIDs.contains(source.id) {
+            result.catalog.sources.append(source)
+        }
+        // Also merge unitBuildingAssociations that carry a referencePlaceID via lazy lookup.
+        let publicAssociations = catalog.unitBuildingAssociations ?? []
+        if publicAssociations.contains(where: { $0.referencePlaceID != nil }) {
+            var associations = result.catalog.unitBuildingAssociations ?? []
+            var associationIDs = Set(associations.map(\.id))
+            var associationKeys = Set(associations.map(associationKey))
+            let publicKeyCounts = Dictionary(grouping: publicAssociations, by: associationKey).mapValues(\.count)
+            for a in publicAssociations {
+                guard let referenceID = a.referencePlaceID,
+                      !associationIDs.contains(a.id), !associationKeys.contains(associationKey(a)),
+                      publicKeyCounts[associationKey(a)] == 1,
+                      admittedAddressKeys[a.communityID]?.contains(LocalSearch.addressKey(a.address)) == true,
+                      !a.sourceIDs.isEmpty, a.sourceIDs.allSatisfy(usableSourceIDs.contains),
+                      let published = resolveReferencePlace(referenceID),
+                      !published.sourceIDs.isEmpty, published.sourceIDs.allSatisfy(usableSourceIDs.contains),
+                      published.matchesBuildingAssociation(a) else { continue }
+                if let existingRef = base?.places.first(where: { $0.id == referenceID }) {
+                    guard existingRef.matchesBuildingAssociation(a),
+                          existingRef.coordinate == published.coordinate,
+                          existingRef.referenceKind == published.referenceKind,
+                          existingRef.estimatedHorizontalUncertaintyM == published.estimatedHorizontalUncertaintyM,
+                          existingRef.mapLabelOccurrenceID == published.mapLabelOccurrenceID,
+                          existingRef.referenceAddresses == published.referenceAddresses,
+                          Set(existingRef.sourceIDs) == Set(published.sourceIDs) else { continue }
+                }
+                associations.append(a); associationIDs.insert(a.id); associationKeys.insert(associationKey(a))
+            }
+            if !associations.isEmpty { result.catalog.unitBuildingAssociations = associations }
+        }
+        return (result, IndexedPolicy(admittedAddressKeys: admittedAddressKeys, usableSourceIDs: usableSourceIDs))
+    }
+
+    public static func filterIndexedPlaces(_ places: [Place], policy: IndexedPolicy, basePlaces: [Place]) -> [Place] {
+        guard !places.isEmpty else { return [] }
+        let baseIDs = Set(basePlaces.map(\.id))
+        let baseIdentities = Set(basePlaces.map(PinIdentity.init))
+        var seenIDs = baseIDs
+        var out: [Place] = []
+        out.reserveCapacity(places.count)
+        for point in places {
+            guard let allowed = policy.admittedAddressKeys[point.communityID],
+                  !point.sourceIDs.isEmpty, point.sourceIDs.allSatisfy(policy.usableSourceIDs.contains),
+                  !seenIDs.contains(point.id),
+                  allowed.contains(LocalSearch.addressKey(point.address)),
+                  (point.referenceAddresses ?? []).allSatisfy({ allowed.contains(LocalSearch.addressKey($0)) }),
+                  !baseIdentities.contains(PinIdentity(point)) else { continue }
+            seenIDs.insert(point.id)
+            out.append(point)
+        }
+        return out
+    }
+
     private static func associationKey(_ a: UnitBuildingAssociation) -> String {
         [a.communityID, LocalSearch.addressKey(a.address), LocalSearch.normalized(a.unit), a.identifierKind.rawValue].joined(separator: "|")
     }
