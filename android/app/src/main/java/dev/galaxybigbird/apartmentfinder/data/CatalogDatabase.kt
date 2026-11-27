@@ -128,9 +128,15 @@ class CatalogDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         val out = ArrayList<Community>(2600)
         readableDatabase.rawQuery(
             """
-            SELECT id, name, address, zip, delivery_addresses_json, aliases_json,
-                   research_status, gap_notes_json, lat, lon, locker_json
-            FROM communities ORDER BY name COLLATE NOCASE
+            SELECT c.id, c.name, c.address, c.zip, c.delivery_addresses_json, c.aliases_json,
+                   c.research_status, c.gap_notes_json,
+                   COALESCE(c.lat, p.avg_lat), COALESCE(c.lon, p.avg_lon), c.locker_json
+            FROM communities c
+            LEFT JOIN (
+                SELECT community_id, AVG(lat) AS avg_lat, AVG(lon) AS avg_lon
+                FROM places GROUP BY community_id
+            ) p ON p.community_id = c.id
+            ORDER BY c.name COLLATE NOCASE
             """.trimIndent(),
             null
         ).use { c ->

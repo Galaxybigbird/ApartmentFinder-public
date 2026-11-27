@@ -182,6 +182,37 @@ class CoreParityTests {
         assertNull(verifiedMatch.issue)
         assertEquals(6.5, checkedDoor.highlightZoneRadiusMeters(completed = false, ready = true), 0.01)
 
+        // EntranceSideEstimate pin matches same street when manifest omits N/S/E/W directional (e.g. SYNC 7089 Aliante Pkwy)
+        val syncPin = Place(
+            id = "sync:directory-side-estimate:unit-3062",
+            communityId = "sync-apartment-homes",
+            address = "7089 North Aliante Parkway",
+            building = "",
+            unit = "3062",
+            kind = LocationKind.UNIT_POSITION,
+            verification = Verification.ESTIMATED,
+            coordinate = Coordinate(36.289635, -115.183339),
+            identityUncertain = true,
+            entranceSideEstimate = EntranceSideEstimate(
+                frontage = listOf(Coordinate(36.289622, -115.183323), Coordinate(36.289647, -115.183354)),
+                workingAllowanceMeters = 10.0
+            )
+        )
+        val syncStop = DeliveryStop(id = "sync-108", sequence = 108, address = "7089 ALIANTE PKWY", unit = "3062")
+        val syncMatch = ApartmentRoutePlanner.resolveDoorMatch(
+            syncStop,
+            "sync-apartment-homes",
+            listOf(syncPin),
+            communityAddresses = listOf("7089 North Aliante Parkway", "7089 Aliante Pkwy", "7089 N Aliante Pkwy")
+        )
+        assertEquals(1, syncMatch.candidates.size)
+        assertEquals(syncPin.id, syncMatch.candidates[0].id)
+        // Must still reject a genuinely different house number or conflicting directional
+        val wrongStreet = DeliveryStop(id = "wrong", sequence = 109, address = "7099 ALIANTE PKWY", unit = "3062")
+        assertTrue(ApartmentRoutePlanner.resolveDoorMatch(wrongStreet, "sync-apartment-homes", listOf(syncPin)).candidates.isEmpty())
+        val wrongDir = DeliveryStop(id = "wrong-dir", sequence = 110, address = "7089 S ALIANTE PKWY", unit = "3062")
+        assertTrue(ApartmentRoutePlanner.resolveDoorMatch(wrongDir, "sync-apartment-homes", listOf(syncPin)).candidates.isEmpty())
+
         // Next apartment picks nearest by fresh GPS
         val fixNearVestra = UserLocationFix(Coordinate(36.0631, -115.2774), 5f, null, System.currentTimeMillis())
         val choice = ApartmentRoutePlanner.selectNextApartment(plan.groups, currentGroupId = "core", fix = fixNearVestra)

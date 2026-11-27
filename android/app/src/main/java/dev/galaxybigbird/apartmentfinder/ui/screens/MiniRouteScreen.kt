@@ -94,13 +94,15 @@ fun MiniRouteScreen(
         return
     }
 
-    val matchesByStopId = remember(group.stops, places, state.selectedDoorIds) {
+    val matchesByStopId = remember(group.stops, places, state.selectedDoorIds, community) {
+        val communityAddresses = community?.matchingAddresses.orEmpty()
         group.stops.associate { stop ->
             stop.id to ApartmentRoutePlanner.resolveDoorMatch(
                 stop = stop,
                 communityId = group.id,
                 places = places,
-                selectedPlaceId = state.selectedDoorIds[stop.id]
+                selectedPlaceId = state.selectedDoorIds[stop.id],
+                communityAddresses = communityAddresses
             )
         }
     }

@@ -9,6 +9,7 @@ public final class PublicPlaceStore: @unchecked Sendable {
     public let url: URL
     public let locationsSHA256: String
     public let communityCounts: [String: Int]
+    public let communityCentroids: [String: Coordinate]
     public let totalCount: Int
     public let unitPositionCount: Int
 
@@ -74,7 +75,8 @@ public final class PublicPlaceStore: @unchecked Sendable {
                 meta[String(cString: k)] = String(cString: v)
             }
         }
-        guard meta["schema_version"] == "1",
+        let schemaVersion = meta["schema_version"]
+        guard (schemaVersion == "1" || schemaVersion == "2"),
               meta["locations_sha256"] == expectedLocationsSHA256,
               let total = meta["total_count"].flatMap(Int.init),
               let units = meta["unit_position_count"].flatMap(Int.init) else {
@@ -87,19 +89,49 @@ public final class PublicPlaceStore: @unchecked Sendable {
         self.unitPositionCount = units
 
         var counts: [String: Int] = [:]
-        var cStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, "SELECT community_id, total_count FROM community_counts", -1, &cStmt, nil) == SQLITE_OK, let cStmt else {
-            sqlite3_close_v2(handle)
-            self.db = nil
-            throw CoreError("Public pin index counts are unreadable.")
-        }
-        defer { sqlite3_finalize(cStmt) }
-        while sqlite3_step(cStmt) == SQLITE_ROW {
-            if let cid = sqlite3_column_text(cStmt, 0) {
-                counts[String(cString: cid)] = Int(sqlite3_column_int64(cStmt, 1))
+        var centroids: [String: Coordinate] = [:]
+        if schemaVersion == "2" {
+            var cStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, "SELECT community_id, total_count, avg_lat, avg_lon FROM community_counts", -1, &cStmt, nil) == SQLITE_OK, let cStmt else {
+                sqlite3_close_v2(handle)
+                self.db = nil
+                throw CoreError("Public pin index counts are unreadable.")
+            }
+            defer { sqlite3_finalize(cStmt) }
+            while sqlite3_step(cStmt) == SQLITE_ROW {
+                if let cidPtr = sqlite3_column_text(cStmt, 0) {
+                    let cid = String(cString: cidPtr)
+                    let cnt = Int(sqlite3_column_int64(cStmt, 1))
+                    counts[cid] = cnt
+                    if cnt > 0 {
+                        let coord = Coordinate(latitude: sqlite3_column_double(cStmt, 2), longitude: sqlite3_column_double(cStmt, 3))
+                        if coord.isValid { centroids[cid] = coord }
+                    }
+                }
+            }
+        } else {
+            // Backwards-compatible fast read for existing Build 33.1 v1 SQLite databases (no rebuild needed!).
+            var cStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, "SELECT community_id, COUNT(*), AVG(lat), AVG(lon) FROM places GROUP BY community_id", -1, &cStmt, nil) == SQLITE_OK, let cStmt else {
+                sqlite3_close_v2(handle)
+                self.db = nil
+                throw CoreError("Public pin index counts are unreadable.")
+            }
+            defer { sqlite3_finalize(cStmt) }
+            while sqlite3_step(cStmt) == SQLITE_ROW {
+                if let cidPtr = sqlite3_column_text(cStmt, 0) {
+                    let cid = String(cString: cidPtr)
+                    let cnt = Int(sqlite3_column_int64(cStmt, 1))
+                    counts[cid] = cnt
+                    if cnt > 0 {
+                        let coord = Coordinate(latitude: sqlite3_column_double(cStmt, 2), longitude: sqlite3_column_double(cStmt, 3))
+                        if coord.isValid { centroids[cid] = coord }
+                    }
+                }
             }
         }
         self.communityCounts = counts
+        self.communityCentroids = centroids
         #else
         throw CoreError("SQLite is required for indexed public pin storage.")
         #endif
@@ -281,7 +313,7 @@ public final class PublicPlaceStore: @unchecked Sendable {
         private let encoder = JSONEncoder()
         private var totalCount = 0
         private var unitPositionCount = 0
-        private var communityCounts: [String: (total: Int, units: Int)] = [:]
+        private var communityStats: [String: (total: Int, units: Int, sumLat: Double, sumLon: Double)] = [:]
         private var finished = false
 
         init(destinationURL: URL, locationsSHA256: String, packVersion: String) throws {
@@ -324,7 +356,9 @@ public final class PublicPlaceStore: @unchecked Sendable {
             CREATE TABLE community_counts (
                 community_id TEXT PRIMARY KEY NOT NULL,
                 total_count INTEGER NOT NULL,
-                unit_count INTEGER NOT NULL
+                unit_count INTEGER NOT NULL,
+                avg_lat REAL NOT NULL,
+                avg_lon REAL NOT NULL
             );
             BEGIN IMMEDIATE;
             """
@@ -403,10 +437,12 @@ public final class PublicPlaceStore: @unchecked Sendable {
             totalCount += 1
             let isUnit = place.kind == .unitPosition
             if isUnit { unitPositionCount += 1 }
-            var bucket = communityCounts[place.communityID] ?? (0, 0)
+            var bucket = communityStats[place.communityID] ?? (0, 0, 0.0, 0.0)
             bucket.total += 1
             if isUnit { bucket.units += 1 }
-            communityCounts[place.communityID] = bucket
+            bucket.sumLat += place.coordinate.latitude
+            bucket.sumLon += place.coordinate.longitude
+            communityStats[place.communityID] = bucket
             #endif
         }
 
@@ -416,14 +452,17 @@ public final class PublicPlaceStore: @unchecked Sendable {
             if let insertStmt { sqlite3_finalize(insertStmt); self.insertStmt = nil }
 
             var countStmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "INSERT INTO community_counts (community_id, total_count, unit_count) VALUES (?, ?, ?)", -1, &countStmt, nil) == SQLITE_OK, let countStmt else {
+            guard sqlite3_prepare_v2(db, "INSERT INTO community_counts (community_id, total_count, unit_count, avg_lat, avg_lon) VALUES (?, ?, ?, ?, ?)", -1, &countStmt, nil) == SQLITE_OK, let countStmt else {
                 cleanup(); throw CoreError("Could not store community counts.")
             }
-            for (cid, counts) in communityCounts {
+            for (cid, stats) in communityStats {
                 sqlite3_reset(countStmt)
                 sqlite3_bind_text(countStmt, 1, cid, -1, PublicPlaceStore.sqliteTransient)
-                sqlite3_bind_int64(countStmt, 2, Int64(counts.total))
-                sqlite3_bind_int64(countStmt, 3, Int64(counts.units))
+                sqlite3_bind_int64(countStmt, 2, Int64(stats.total))
+                sqlite3_bind_int64(countStmt, 3, Int64(stats.units))
+                let denom = Double(max(1, stats.total))
+                sqlite3_bind_double(countStmt, 4, stats.sumLat / denom)
+                sqlite3_bind_double(countStmt, 5, stats.sumLon / denom)
                 guard sqlite3_step(countStmt) == SQLITE_DONE else {
                     sqlite3_finalize(countStmt); cleanup(); throw CoreError("Could not insert community count.")
                 }
@@ -435,7 +474,7 @@ public final class PublicPlaceStore: @unchecked Sendable {
                 cleanup(); throw CoreError("Could not store index metadata.")
             }
             let metaPairs = [
-                ("schema_version", "1"),
+                ("schema_version", "2"),
                 ("locations_sha256", locationsSHA256),
                 ("pack_version", packVersion),
                 ("total_count", String(totalCount)),

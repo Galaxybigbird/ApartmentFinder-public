@@ -445,6 +445,26 @@ final class PublicCatalogUpdateTests: XCTestCase {
         XCTAssertEqual(LocalSearch.addressKey(resolved.address), "4425 w rome blvd")
         XCTAssertEqual(resolved.unit, "111")
         XCTAssertFalse(resolved.hasConflictingUnit)
+
+        // Regression test for SYNC Apartment Homes (Stop 108, Units 3062 & 3086) when OnTrac omits "N" directional
+        // AND community catalog record has nil lat/lon (must resolve centroid from SQLite + match ESE wall pins!).
+        let syncComm = try XCTUnwrap(sel.catalog.communities.first(where: { $0.id == "sync-apartment-homes" }))
+        let syncCentroid = try XCTUnwrap(sel.placeStore.communityCentroids["sync-apartment-homes"])
+        XCTAssertTrue(syncCentroid.isValid)
+        let syncPins = sel.placeStore.places(in: "sync-apartment-homes")
+        XCTAssertGreaterThan(syncPins.count, 200)
+        for u in ["3062", "3086"] {
+            let stop = DeliveryStop(sequence: 108, address: "7089 ALIANTE PKWY", unit: u)
+            let match = ApartmentDoorMatch.resolve(stop: stop, communityID: "sync-apartment-homes",
+                                                   places: syncPins, communityAddresses: syncComm.matchingAddresses)
+            XCTAssertEqual(match.candidates.count, 1, "SYNC unit \(u) must match wall-frontage pin even without N directional")
+            XCTAssertNotNil(match.candidates.first?.entranceSideEstimate)
+        }
+        // Also verify directional-omitted street in DeliveryAddress.Resolver for Rome Park Villas ("4425 ROME BLVD 111")
+        let romeNoDir = resolver.resolve("4425 ROME BLVD 111 NORTH LAS VEGAS, NV 89084", unit: "")
+        XCTAssertEqual(LocalSearch.addressKey(romeNoDir.address), "4425 w rome blvd")
+        XCTAssertEqual(romeNoDir.unit, "111")
+
         let fpEnd = jetsamFootprintMB()
         print(String(format: "ALL LIVE WAVE 36 CHECKS PASSED in %.2fs | final phys_footprint=%.1f MB peak=%.1f MB",
                      Date().timeIntervalSince(t0), fpEnd.current, fpEnd.peak))

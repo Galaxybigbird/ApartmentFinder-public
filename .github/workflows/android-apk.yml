@@ -69,8 +69,8 @@ jobs:
           APKSIGNER="$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)"
           "$APKSIGNER" verify --verbose "$APK_IN"
           mkdir -p dist-android
-          cp "$APK_IN" "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk"
-          sha256sum "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk" > "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk.sha256"
+          cp "$APK_IN" "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk"
+          sha256sum "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk" > "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk.sha256"
           ls -lh dist-android/
 
       - name: Upload APK workflow artifact
@@ -85,32 +85,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="android-v0.1.0-32.1"
+          TAG="android-v0.1.0-34.1"
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
           cat <<'EOF' > "$NOTES_FILE"
-          Native Android build of ApartmentFinder (0.1.0 · parity with iOS Build 32.1).
+          Native Android build of ApartmentFinder (0.1.0 · parity with iOS Build 34.1).
 
           ### Highlights
-          - Auto-syncs the live Las Vegas Valley **Wave 36+** catalog (**2,463 communities · 355,222 precision pins across 65 ZIPs**) via streaming gzip SQLite ingest.
-          - Full North Las Vegas (`N Las Vegas`, `N. Las Vegas`), Boulder City, and Clark County locality suffix parsing parity for OnTrac manifests.
-          - **Zero plain teardrop pins** — full Latigo/Lyric-inspired MapLibre GL satellite + street precision pins (outer geodesic building zone, 2.2 m solid inner core, wall frontage highlight lines, floating dark-glass capsules + target anchor dots).
+          - Fixes wall-frontage ESE pin matching across 278 communities (including **SYNC Apartment Homes**, Zerzura, Diamond Sands, Fora, Summit on Boulder) when OnTrac omits street directionals (`7089 Aliante Pkwy` vs `7089 North Aliante Parkway`).
+          - Automatically derives community map coordinates from mapped pin centroids for all 827 communities missing catalog lat/lon (eliminates "Community location not mapped" & "Apartment location missing").
+          - Auto-syncs the live Las Vegas Valley **Wave 36+** catalog (**2,463 communities · 355,222 precision pins across 65 ZIPs**).
 
           ### Install on Android
-          1. Tap **ApartmentFinder-Android-0.1.0-32.1.apk** below to download on your phone.
+          1. Tap **ApartmentFinder-Android-0.1.0-34.1.apk** below to download on your phone.
           2. Open the downloaded file and tap **Install** (allow *Install unknown apps* if prompted).
           3. Launch ApartmentFinder — it automatically downloads and indexes the live Wave 36+ Las Vegas Valley pin catalog on first run.
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
-              "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk" \
-              "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk.sha256" \
+              "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk" \
+              "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk.sha256" \
               --clobber
-            gh release edit "$TAG" --title "ApartmentFinder Android 0.1.0 (Build 32.1)" --notes-file "$NOTES_FILE"
+            gh release edit "$TAG" --title "ApartmentFinder Android 0.1.0 (Build 34.1)" --notes-file "$NOTES_FILE"
           else
             gh release create "$TAG" \
-              "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk" \
-              "dist-android/ApartmentFinder-Android-0.1.0-32.1.apk.sha256" \
-              --title "ApartmentFinder Android 0.1.0 (Build 32.1)" \
+              "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk" \
+              "dist-android/ApartmentFinder-Android-0.1.0-34.1.apk.sha256" \
+              --title "ApartmentFinder Android 0.1.0 (Build 34.1)" \
               --notes-file "$NOTES_FILE"
           fi

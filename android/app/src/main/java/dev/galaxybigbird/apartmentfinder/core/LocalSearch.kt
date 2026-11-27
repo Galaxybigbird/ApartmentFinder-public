@@ -35,8 +35,17 @@ object LocalSearch {
         "boulevard" to "blvd",
         "court" to "ct",
         "way" to "wy",
-        "parkway" to "pkwy"
+        "parkway" to "pkwy",
+        "highway" to "hwy",
+        "circle" to "cir",
+        "place" to "pl",
+        "terrace" to "ter",
+        "trail" to "trl",
+        "point" to "pt",
+        "cove" to "cv",
+        "square" to "sq"
     )
+    private val cardinalDirections = setOf("n", "s", "e", "w")
 
     fun normalized(value: String): String {
         val decomposed = Normalizer.normalize(value, Normalizer.Form.NFD)
@@ -52,6 +61,33 @@ object LocalSearch {
         return nonAlnumRegex.split(text)
             .filter { it.isNotEmpty() }
             .joinToString(" ") { streetAliases[it] ?: it }
+    }
+
+    fun sameStreetIgnoringDirectional(lhsKey: String, rhsKey: String): Boolean {
+        if (lhsKey.isEmpty() || rhsKey.isEmpty()) return false
+        if (lhsKey == rhsKey) return true
+        val a = lhsKey.split(' ').filter { it.isNotEmpty() }
+        val b = rhsKey.split(' ').filter { it.isNotEmpty() }
+        val firstA = a.firstOrNull() ?: return false
+        val firstB = b.firstOrNull() ?: return false
+        if (firstA != firstB || !firstA.any { it.isDigit() }) return false
+        val dirsA = a.drop(1).filter { it in cardinalDirections }.toSet()
+        val dirsB = b.drop(1).filter { it in cardinalDirections }.toSet()
+        if (dirsA.isNotEmpty() && dirsB.isNotEmpty() && dirsA != dirsB) return false
+        val coreA = a.drop(1).filter { it !in cardinalDirections }
+        val coreB = b.drop(1).filter { it !in cardinalDirections }
+        return coreA.isNotEmpty() && coreA == coreB
+    }
+
+    fun directionalStrippedKey(key: String): String? {
+        val tokens = key.split(' ').filter { it.isNotEmpty() }
+        val first = tokens.firstOrNull() ?: return null
+        if (!first.any { it.isDigit() }) return null
+        val rest = tokens.drop(1)
+        if (rest.none { it in cardinalDirections }) return null
+        val core = rest.filter { it !in cardinalDirections }
+        if (core.isEmpty()) return null
+        return (listOf(first) + core).joinToString(" ")
     }
 
     fun locations(address: String, unit: String, building: String = "", places: List<Place>): List<Place> {

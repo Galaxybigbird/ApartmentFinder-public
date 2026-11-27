@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run public ApartmentCore Swift unit tests
-        run: swift test --disable-automatic-resolution --skip-update --filter "PublicCatalogUpdateTests|ManifestTests"
+        run: swift test --disable-automatic-resolution --skip-update --filter "PublicCatalogUpdateTests|ManifestTests|EntranceSideEstimateTests|ApartmentRouteTests|AddressLookupTests"
 
       - name: Live Wave 36 streaming install & peak RSS verification
         if: ${{ inputs.run_live_wave_benchmark }}

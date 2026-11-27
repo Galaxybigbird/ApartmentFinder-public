@@ -122,13 +122,14 @@ object ApartmentRoutePlanner {
         stop: DeliveryStop,
         communityId: String,
         places: List<Place>,
-        selectedPlaceId: String? = null
+        selectedPlaceId: String? = null,
+        communityAddresses: List<String> = emptyList()
     ): ApartmentDoorMatch {
         val local = places.filter { it.communityId == communityId }
         val resolved = DeliveryAddress.resolve(
             stop.address,
             suppliedUnit = stop.unit,
-            knownAddresses = local.map { it.address }.distinct()
+            knownAddresses = (local.map { it.address } + communityAddresses).distinct()
         )
         if (resolved.hasConflictingUnit) {
             return ApartmentDoorMatch(issue = DoorMatchIssue.CHECK_UNIT)
@@ -139,14 +140,29 @@ object ApartmentRoutePlanner {
         }
 
         val addressKeys = local.map { LocalSearch.addressKey(it.address) }.filter { it.isNotEmpty() }.toSet()
+        val aliasKeys = communityAddresses.map { LocalSearch.addressKey(it) }.filter { it.isNotEmpty() }.toSet()
         val stopAddressKey = LocalSearch.addressKey(resolved.address)
+        val stopStreetNumber = stopAddressKey.split(' ').firstOrNull()
+
+        fun streetMatches(place: Place): Boolean {
+            val placeKey = LocalSearch.addressKey(place.address)
+            if (placeKey == stopAddressKey || LocalSearch.sameStreetIgnoringDirectional(placeKey, stopAddressKey)) {
+                return true
+            }
+            if (addressKeys.size <= 1 && placeKey in aliasKeys && stopAddressKey in aliasKeys &&
+                stopStreetNumber != null && placeKey.split(' ').firstOrNull() == stopStreetNumber
+            ) {
+                return true
+            }
+            return false
+        }
 
         val candidates = local.filter { place ->
             (place.kind == LocationKind.DOOR || place.kind == LocationKind.UNIT_POSITION) &&
                 place.coordinate.isValid &&
                 LocalSearch.normalized(place.unit) == unitKey &&
-                (addressKeys.size <= 1 || LocalSearch.addressKey(place.address) == stopAddressKey) &&
-                (place.entranceSideEstimate == null || LocalSearch.addressKey(place.address) == stopAddressKey)
+                (addressKeys.size <= 1 || streetMatches(place)) &&
+                (place.entranceSideEstimate == null || streetMatches(place))
         }.sortedBy { it.id }
 
         val verified = candidates.filter { it.kind == LocationKind.DOOR && it.verification == Verification.FIELD_VERIFIED }

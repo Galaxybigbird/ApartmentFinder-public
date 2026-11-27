@@ -53,8 +53,13 @@ public struct ApartmentGroup: Identifiable, Sendable {
 
     public func scopedPlaces(in index: [String: [Place]]) -> [Place] {
         func matchesStreet(_ place: Place, _ key: String) -> Bool {
-            LocalSearch.addressKey(place.address) == key || place.isValidBuildingAreaReference &&
-                (place.referenceAddresses ?? []).contains { LocalSearch.addressKey($0) == key }
+            let placeKey = LocalSearch.addressKey(place.address)
+            if placeKey == key || LocalSearch.sameStreetIgnoringDirectional(placeKey, key) { return true }
+            return place.isValidBuildingAreaReference &&
+                (place.referenceAddresses ?? []).contains {
+                    let aliasKey = LocalSearch.addressKey($0)
+                    return aliasKey == key || LocalSearch.sameStreetIgnoringDirectional(aliasKey, key)
+                }
         }
         var owned = index[id] ?? []
         if let legacyCommunityID, legacyCommunityID != id {
@@ -162,18 +167,31 @@ public struct ApartmentDoorMatch: Sendable {
               !candidate.floor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return (candidate.building, candidate.floor)
     }
-    public static func resolve(stop: DeliveryStop, communityID: String, places: [Place], selectedPlaceID: String? = nil, buildingAssociations: [UnitBuildingAssociation] = [], floorReferences: [UnitFloorReference] = []) -> Self {
+    public static func resolve(stop: DeliveryStop, communityID: String, places: [Place], selectedPlaceID: String? = nil, buildingAssociations: [UnitBuildingAssociation] = [], floorReferences: [UnitFloorReference] = [], communityAddresses: [String] = []) -> Self {
         let local = places.filter { $0.communityID == communityID }
-        let resolved = DeliveryAddress.resolve(stop.address, unit: stop.unit, knownAddresses: local.map(\.address) + buildingAssociations.filter { $0.communityID == communityID }.map(\.address))
+        let resolved = DeliveryAddress.resolve(stop.address, unit: stop.unit, knownAddresses: local.map(\.address) + communityAddresses + buildingAssociations.filter { $0.communityID == communityID }.map(\.address))
         if resolved.hasConflictingUnit { return Self(candidates: [], issue: .checkUnit) }
         let unit = LocalSearch.normalized(resolved.unit)
         if unit.isEmpty { return Self(candidates: [], issue: .addUnit) }
         let addressKeys = Set(local.map { LocalSearch.addressKey($0.address) }.filter { !$0.isEmpty })
+        let aliasKeys = Set(communityAddresses.map { LocalSearch.addressKey($0) }.filter { !$0.isEmpty })
         let stopAddressKey = LocalSearch.addressKey(resolved.address)
+        let stopStreetNumber = stopAddressKey.split(separator: " ").first
+        func streetMatches(_ place: Place) -> Bool {
+            let placeKey = LocalSearch.addressKey(place.address)
+            if placeKey == stopAddressKey || LocalSearch.sameStreetIgnoringDirectional(placeKey, stopAddressKey) {
+                return true
+            }
+            if addressKeys.count <= 1, aliasKeys.contains(placeKey), aliasKeys.contains(stopAddressKey),
+               let stopStreetNumber, placeKey.split(separator: " ").first == stopStreetNumber {
+                return true
+            }
+            return false
+        }
         let candidates = local.filter {
             ($0.kind == .door || $0.kind == .unitPosition) && $0.coordinate.isValid && LocalSearch.normalized($0.unit) == unit
-                && (addressKeys.count <= 1 || LocalSearch.addressKey($0.address) == stopAddressKey)
-                && ($0.entranceSideEstimate == nil || LocalSearch.addressKey($0.address) == stopAddressKey)
+                && (addressKeys.count <= 1 || streetMatches($0))
+                && ($0.entranceSideEstimate == nil || streetMatches($0))
         }.sorted { $0.id < $1.id }
         let verified = candidates.filter { $0.kind == .door && $0.verification == .fieldVerified }
         if addressKeys.count > 1, let selectedPlaceID,

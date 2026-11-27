@@ -686,8 +686,33 @@ final class AppStore: ObservableObject {
             let directory = communities
             let rules = PersonalCommunityDirectory.preservingRules(places: personal.places,
                 rules: personal.apartmentRules, communities: directory)
-            return ApartmentRoutePlan.make(stops: personal.stops, communities: directory, rules: rules,
+            var plan = ApartmentRoutePlan.make(stops: personal.stops, communities: directory, rules: rules,
                                     corrections: personal.stopCorrections, personalCommunityIDs: personalCommunityIDs)
+            // Fill missing community coordinates from mapped pin centroids (fixes 827 communities
+            // whose catalog record omits lat/lon despite having 100-600+ mapped unit pins).
+            let byID = Dictionary(directory.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for i in plan.groups.indices where plan.groups[i].coordinate?.isValid != true {
+                let g = plan.groups[i]
+                let ids = [g.id, g.directoryCommunityID, g.legacyCommunityID].compactMap { $0 }
+                if let indexed = indexedPublicCatalog {
+                    if let centroid = ids.compactMap({ indexed.placeStore.communityCentroids[$0] }).first {
+                        plan.groups[i].coordinate = centroid
+                        continue
+                    }
+                } else {
+                    let pts = ids.flatMap { apartmentPlacesByCommunity[$0] ?? [] }.filter { $0.coordinate.isValid }
+                    if !pts.isEmpty {
+                        let lat = pts.reduce(0.0) { $0 + $1.coordinate.latitude } / Double(pts.count)
+                        let lon = pts.reduce(0.0) { $0 + $1.coordinate.longitude } / Double(pts.count)
+                        plan.groups[i].coordinate = Coordinate(latitude: lat, longitude: lon)
+                        continue
+                    }
+                }
+                if let lockerCoord = ids.compactMap({ byID[$0]?.digitalLocker?.point?.coordinate }).first(where: \.isValid) {
+                    plan.groups[i].coordinate = lockerCoord
+                }
+            }
+            return plan
         }
         scopedApartmentPlaces.removeAll(); scopedBuildingAssociations.removeAll()
         cachedDoorMatches.removeAll()
@@ -725,7 +750,8 @@ final class AppStore: ObservableObject {
         guard let group = apartmentGroup(groupID) else { return nil }
         let ids = Set([group.id, group.directoryCommunityID, group.legacyCommunityID].compactMap { $0 })
         let matches = communities.filter { ids.contains($0.id) && $0.matchingAddresses.contains {
-            LocalSearch.addressKey($0) == LocalSearch.addressKey(group.address)
+            let k1 = LocalSearch.addressKey($0), k2 = LocalSearch.addressKey(group.address)
+            return k1 == k2 || LocalSearch.sameStreetIgnoringDirectional(k1, k2)
         } }
         guard matches.count == 1 else { return nil }
         return matches.first?.digitalLocker
@@ -774,9 +800,14 @@ final class AppStore: ObservableObject {
                 floors.append(projected)
             }
         }
+        let matchingCommunityIDs = Set([groupID, group?.directoryCommunityID, group?.legacyCommunityID].compactMap { $0 })
+        let communityAddresses = communities
+            .filter { matchingCommunityIDs.contains($0.id) }
+            .flatMap(\.matchingAddresses)
         let match = ApartmentDoorMatch.resolve(stop: stop, communityID: groupID, places: scoped,
             selectedPlaceID: personal.doorSelections.first { $0.stopID == stop.id }?.placeID,
-            buildingAssociations: associations, floorReferences: floors)
+            buildingAssociations: associations, floorReferences: floors,
+            communityAddresses: communityAddresses)
         cachedDoorMatches[key] = match
         return match
     }

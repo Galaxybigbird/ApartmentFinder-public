@@ -200,6 +200,27 @@ final class EntranceSideEstimateTests: XCTestCase {
         XCTAssertNil(match.readyDoor)
     }
 
+    func testEstimateMatchesSameStreetWhenDirectionalOmittedAndRejectsConflictingDirectional() throws {
+        var json = try pointJSON()
+        json["address"] = "7089 North Aliante Parkway"
+        json["unit"] = "3062"
+        let candidate = try decode(json)
+        let omittedDir = ApartmentDoorMatch.resolve(
+            stop: DeliveryStop(sequence: 108, address: "7089 ALIANTE PKWY", unit: "3062"),
+            communityID: "fictional",
+            places: [candidate],
+            communityAddresses: ["7089 North Aliante Parkway", "7089 Aliante Pkwy", "7089 N Aliante Pkwy"]
+        )
+        XCTAssertEqual(omittedDir.candidates.count, 1)
+        let conflictingDir = ApartmentDoorMatch.resolve(
+            stop: DeliveryStop(sequence: 108, address: "7089 S ALIANTE PKWY", unit: "3062"),
+            communityID: "fictional",
+            places: [candidate],
+            communityAddresses: ["7089 North Aliante Parkway", "7089 Aliante Pkwy"]
+        )
+        XCTAssertTrue(conflictingDir.candidates.isEmpty)
+    }
+
     func testUniqueOrSelectedCheckedPersonalDoorWinsDespiteEstimateIdentityAndOtherStreet() throws {
         var estimate = metadata; estimate["dwellingFloorEvidence"] = "currentExplicit"; estimate["dwellingFloor"] = "2"
         var json = try pointJSON(estimate); json["floor"] = "2"
