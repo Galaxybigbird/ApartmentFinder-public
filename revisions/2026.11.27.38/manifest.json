@@ -1,0 +1,29 @@
+{
+  "files": {
+    "public-catalog.json": {
+      "bytes": 4995296,
+      "compressedBytes": 479582,
+      "compressedSHA256": "0ea90ba7a42925b82e59393c1e526e6b6bfbf554a97890a8fd5540a0b8510fbb",
+      "encoding": "gzip",
+      "sha256": "5d0e9eac93a52451f1a156c2edbc4e766ded8d4bcfe41e46d4c76f7f11fe9c97"
+    },
+    "public-locations.geojson": {
+      "bytes": 235964855,
+      "compressedBytes": 5261088,
+      "compressedSHA256": "cd2db93ef21af89878669f02f946acfa519aaa4333139d493c4b9a4e1276d386",
+      "encoding": "gzip",
+      "sha256": "6de2adb910c230aec388ce3870f77b9e02b62e331b7b2138430be3e4f650d98b"
+    },
+    "public-paths.geojson": {
+      "bytes": 8926,
+      "compressedBytes": 1000,
+      "compressedSHA256": "a7b6ae83df59d45163fd6cd4fd5ffa8bc43041fbcb38b88b6acade4b54799d41",
+      "encoding": "gzip",
+      "sha256": "018de3a4c5a5d420773f19ba3e368be26a305cd203117621c112077c428cd739"
+    }
+  },
+  "packVersion": "2026.11.27.38",
+  "revision": "2026.11.27.38",
+  "schemaVersion": 2,
+  "sequence": 298
+}
